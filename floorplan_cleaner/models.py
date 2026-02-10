@@ -21,6 +21,8 @@ class Room:
     flood_mask: np.ndarray  # boolean mask at raster resolution
     bbox_svg: tuple  # (x, y, w, h) in SVG coordinate space
     unit_id: int | None = None
+    split_from: int | None = None  # id of original room this was split from
+    split_line_px: tuple | None = None  # ((x1,y1),(x2,y2)) in pixel coords for mask generation
 
 
 @dataclass

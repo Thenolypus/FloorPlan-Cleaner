@@ -62,6 +62,8 @@ class Exporter:
                     },
                     "output_file": relative_path,
                 }
+                if room.split_from is not None:
+                    room_entry["split_from"] = room.split_from
                 unit_entry["rooms"].append(room_entry)
 
             # Generate combined mask for the unit

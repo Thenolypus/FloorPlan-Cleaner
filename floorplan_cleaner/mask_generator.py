@@ -56,6 +56,11 @@ class MaskGenerator:
         # Overlay windows
         self._overlay_elements(result, boundary_zone, self.windows, x_min_ext, y_min_ext, w, h, 255)
 
+        # Overlay synthetic door at split boundary if this room was split
+        if room.split_line_px is not None:
+            self._overlay_split_boundary(result, crop_mask, room.split_line_px,
+                                         x_min_ext, y_min_ext, w, h)
+
         # Pad to square
         result = self._pad_to_square(result)
 
@@ -99,6 +104,52 @@ class MaskGenerator:
         pw = int(bw * self.filler.scale)
         ph = int(bh * self.filler.scale)
         return (px, py, pw, ph)
+
+    def _overlay_split_boundary(self, result: np.ndarray, crop_mask: np.ndarray,
+                                split_line_px: tuple, x_off: int, y_off: int,
+                                w: int, h: int):
+        """Encode the split boundary as a synthetic archway door.
+
+        Central ~65% of the split edge is marked as door (170).
+        Corner ~17.5% on each end stays void (0) to simulate wall segments.
+        """
+        p1_full, p2_full = split_line_px
+        p1 = (p1_full[0] - x_off, p1_full[1] - y_off)
+        p2 = (p2_full[0] - x_off, p2_full[1] - y_off)
+
+        # Build boundary zone for this room half
+        kernel_dilate = np.ones((11, 11), dtype=np.uint8)
+        kernel_erode = np.ones((3, 3), dtype=np.uint8)
+        dilated = cv2.dilate(crop_mask.astype(np.uint8), kernel_dilate, iterations=1)
+        eroded = cv2.erode(crop_mask.astype(np.uint8), kernel_erode, iterations=1)
+        boundary_zone = (dilated > 0) & (eroded == 0)
+
+        # Draw the full split line
+        line_img = np.zeros((h, w), dtype=np.uint8)
+        cv2.line(line_img, p1, p2, 255, thickness=3)
+
+        # Find pixels on the split line AND in the boundary zone
+        split_boundary = (line_img > 0) & boundary_zone
+        ys, xs = np.where(split_boundary)
+
+        if len(xs) == 0:
+            return
+
+        # Compute parametric position along the line for each pixel (0..1)
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        line_len_sq = dx * dx + dy * dy
+        if line_len_sq == 0:
+            return
+
+        t_values = ((xs - p1[0]) * dx + (ys - p1[1]) * dy) / line_len_sq
+        t_values = np.clip(t_values, 0.0, 1.0)
+
+        # Central 65% is door (170), corners (17.5% each end) stay void (0)
+        corner_frac = 0.175
+        door_pixels = (t_values >= corner_frac) & (t_values <= 1.0 - corner_frac)
+
+        result[ys[door_pixels], xs[door_pixels]] = 170
 
     def generate_combined_mask(self, rooms: list[Room]) -> np.ndarray:
         """Generate a single 120x120 grayscale mask with all rooms combined.
@@ -149,6 +200,13 @@ class MaskGenerator:
         # Overlay doors and windows
         self._overlay_elements(result, boundary_zone, self.doors, x_min_ext, y_min_ext, w, h, 170)
         self._overlay_elements(result, boundary_zone, self.windows, x_min_ext, y_min_ext, w, h, 255)
+
+        # Overlay synthetic doors at split boundaries for split rooms
+        for room in rooms:
+            if room.split_line_px is not None:
+                crop_mask = room.flood_mask[y_min_ext:y_max_ext + 1, x_min_ext:x_max_ext + 1]
+                self._overlay_split_boundary(result, crop_mask, room.split_line_px,
+                                             x_min_ext, y_min_ext, w, h)
 
         result = self._pad_to_square(result)
         result = cv2.resize(result, (120, 120), interpolation=cv2.INTER_NEAREST)

@@ -1,8 +1,15 @@
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QRectF
-from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QWheelEvent, QMouseEvent
-from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QLineF
+from PySide6.QtGui import (
+    QImage, QPixmap, QColor, QPainter, QWheelEvent, QMouseEvent, QPen,
+)
+from PySide6.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QGraphicsLineItem, QGraphicsEllipseItem,
+)
 from PySide6.QtSvg import QSvgRenderer
+
+from .room_splitter import snap_to_contour
 
 
 # Colors for room overlays, cycled per unit
@@ -19,9 +26,14 @@ UNIT_COLORS = [
 SELECTED_ROOM_COLOR = QColor(255, 255, 0, 120)   # yellow - currently selected in list
 LABELED_ROOM_COLOR = QColor(100, 255, 100, 100)   # green - labeled but not yet saved
 
+# Colors for split half previews
+SPLIT_HALF_A_COLOR = QColor(0, 200, 200, 100)    # cyan
+SPLIT_HALF_B_COLOR = QColor(200, 0, 200, 100)     # magenta
+
 
 class FloorPlanCanvas(QGraphicsView):
     room_clicked = Signal(int, int)  # pixel x, y on the raster image
+    split_line_complete = Signal(int, int, int, int)  # p1x, p1y, p2x, p2y
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -39,6 +51,23 @@ class FloorPlanCanvas(QGraphicsView):
         self._raster_h = 0
         self._panning = False
         self._pan_start = None
+
+        # Split-line state
+        self._split_mode = False
+        self._split_state = "IDLE"  # "IDLE" | "FIRST_CLICK" | "COMPLETE"
+        self._split_p1: tuple[int, int] | None = None
+        self._split_p2: tuple[int, int] | None = None
+        self._split_contour: np.ndarray | None = None
+        self._split_room_id: int | None = None
+
+        # Split graphics items
+        self._split_preview_line: QGraphicsLineItem | None = None
+        self._split_final_line: QGraphicsLineItem | None = None
+        self._split_point_items: list[QGraphicsEllipseItem] = []
+        self._split_half_overlays: dict[str, QGraphicsPixmapItem] = {}
+
+        # Enable mouse tracking for live preview line
+        self.setMouseTracking(True)
 
     def load_svg(self, svg_path: str, target_longest_side: int = 2000) -> tuple[int, int]:
         """Load an SVG file and render it to a raster image for display.
@@ -111,6 +140,93 @@ class FloorPlanCanvas(QGraphicsView):
         """Update a room overlay's color (e.g., when assigned to a unit)."""
         self.add_room_overlay(room_id, mask, unit_id)
 
+    # --- Split mode methods ---
+
+    def enter_split_mode(self, room_id: int, contour: np.ndarray):
+        """Enter split-line drawing mode for a room."""
+        self._split_mode = True
+        self._split_state = "IDLE"
+        self._split_p1 = None
+        self._split_p2 = None
+        self._split_contour = contour
+        self._split_room_id = room_id
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def exit_split_mode(self):
+        """Exit split mode and clean up all split graphics."""
+        self._split_mode = False
+        self._split_state = "IDLE"
+        self._split_p1 = None
+        self._split_p2 = None
+        self._split_contour = None
+        self._split_room_id = None
+        self._clear_split_graphics()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def clear_split_preview(self):
+        """Clear split preview graphics but stay in split mode for redo."""
+        self._split_state = "IDLE"
+        self._split_p1 = None
+        self._split_p2 = None
+        self._clear_split_graphics()
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def _clear_split_graphics(self):
+        """Remove all split-related graphics items from the scene."""
+        if self._split_preview_line is not None:
+            self._scene.removeItem(self._split_preview_line)
+            self._split_preview_line = None
+        if self._split_final_line is not None:
+            self._scene.removeItem(self._split_final_line)
+            self._split_final_line = None
+        for item in self._split_point_items:
+            self._scene.removeItem(item)
+        self._split_point_items.clear()
+        for key in list(self._split_half_overlays.keys()):
+            self._scene.removeItem(self._split_half_overlays[key])
+        self._split_half_overlays.clear()
+
+    def show_split_preview(self, half_a: np.ndarray, half_b: np.ndarray):
+        """Show cyan/magenta overlays for the two split halves."""
+        # Remove original room overlay
+        if self._split_room_id is not None:
+            self.remove_room_overlay(self._split_room_id)
+
+        for key, (mask, color) in [
+            ("a", (half_a, SPLIT_HALF_A_COLOR)),
+            ("b", (half_b, SPLIT_HALF_B_COLOR)),
+        ]:
+            h, w = mask.shape
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[mask, 0] = color.blue()
+            rgba[mask, 1] = color.green()
+            rgba[mask, 2] = color.red()
+            rgba[mask, 3] = color.alpha()
+
+            overlay = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_ARGB32)
+            overlay = overlay.copy()
+            pixmap = QPixmap.fromImage(overlay)
+
+            if key in self._split_half_overlays:
+                self._scene.removeItem(self._split_half_overlays[key])
+
+            item = self._scene.addPixmap(pixmap)
+            item.setZValue(2)
+            self._split_half_overlays[key] = item
+
+    def _add_split_point_dot(self, px: int, py: int):
+        """Draw a small red dot at a split point."""
+        r = 4
+        dot = self._scene.addEllipse(
+            px - r, py - r, r * 2, r * 2,
+            QPen(QColor(255, 0, 0)),
+            QColor(255, 0, 0, 200),
+        )
+        dot.setZValue(3)
+        self._split_point_items.append(dot)
+
+    # --- Event handlers ---
+
     def wheelEvent(self, event: QWheelEvent):
         """Zoom in/out with mouse wheel."""
         factor = 1.15
@@ -129,14 +245,61 @@ class FloorPlanCanvas(QGraphicsView):
             return
 
         if event.button() == Qt.MouseButton.LeftButton and self._base_pixmap_item:
-            # Room selection click
             scene_pos = self.mapToScene(event.position().toPoint())
             px = int(scene_pos.x())
             py = int(scene_pos.y())
-            if 0 <= px < self._raster_w and 0 <= py < self._raster_h:
-                self.room_clicked.emit(px, py)
+
+            if not (0 <= px < self._raster_w and 0 <= py < self._raster_h):
+                super().mousePressEvent(event)
+                return
+
+            # Split mode takes precedence
+            if self._split_mode and self._split_contour is not None:
+                snapped = snap_to_contour((px, py), self._split_contour)
+
+                if self._split_state == "IDLE":
+                    self._split_p1 = snapped
+                    self._add_split_point_dot(snapped[0], snapped[1])
+                    self._split_state = "FIRST_CLICK"
+                    event.accept()
+                    return
+
+                elif self._split_state == "FIRST_CLICK":
+                    self._split_p2 = snapped
+                    self._add_split_point_dot(snapped[0], snapped[1])
+
+                    # Remove preview line
+                    if self._split_preview_line is not None:
+                        self._scene.removeItem(self._split_preview_line)
+                        self._split_preview_line = None
+
+                    # Draw final line
+                    pen = QPen(QColor(255, 0, 0), 2)
+                    self._split_final_line = self._scene.addLine(
+                        QLineF(
+                            QPointF(self._split_p1[0], self._split_p1[1]),
+                            QPointF(self._split_p2[0], self._split_p2[1]),
+                        ),
+                        pen,
+                    )
+                    self._split_final_line.setZValue(3)
+
+                    self._split_state = "COMPLETE"
+                    self.split_line_complete.emit(
+                        self._split_p1[0], self._split_p1[1],
+                        self._split_p2[0], self._split_p2[1],
+                    )
+                    event.accept()
+                    return
+
+                # In COMPLETE state, ignore clicks
                 event.accept()
                 return
+
+            # Normal room selection
+            self.room_clicked.emit(px, py)
+            event.accept()
+            return
 
         super().mousePressEvent(event)
 
@@ -150,13 +313,38 @@ class FloorPlanCanvas(QGraphicsView):
                 self.verticalScrollBar().value() - delta.y())
             event.accept()
             return
+
+        # Live preview line during split mode
+        if (self._split_mode and self._split_state == "FIRST_CLICK"
+                and self._split_p1 is not None and self._split_contour is not None):
+            scene_pos = self.mapToScene(event.position().toPoint())
+            mx = int(scene_pos.x())
+            my = int(scene_pos.y())
+            if 0 <= mx < self._raster_w and 0 <= my < self._raster_h:
+                snapped = snap_to_contour((mx, my), self._split_contour)
+                line = QLineF(
+                    QPointF(self._split_p1[0], self._split_p1[1]),
+                    QPointF(snapped[0], snapped[1]),
+                )
+                if self._split_preview_line is not None:
+                    self._split_preview_line.setLine(line)
+                else:
+                    pen = QPen(QColor(255, 0, 0, 150), 1, Qt.PenStyle.DashLine)
+                    self._split_preview_line = self._scene.addLine(line, pen)
+                    self._split_preview_line.setZValue(3)
+            event.accept()
+            return
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.RightButton and self._panning:
             self._panning = False
             self._pan_start = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            if self._split_mode:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
             event.accept()
             return
         super().mouseReleaseEvent(event)
