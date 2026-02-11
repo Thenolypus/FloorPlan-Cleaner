@@ -1,2 +1,2 @@
 # FloorPlan-Cleaner
-FloorPlan Cleaner UI for ReSpace Preprocessing
+FloorPlan Cleaner UI for SemLayoutDiff Preprocessing

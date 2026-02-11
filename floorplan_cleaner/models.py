@@ -17,7 +17,7 @@ class IfcElement:
 @dataclass
 class Room:
     id: int
-    label: str  # "bedroom", "livingroom/diningroom", "all", or "" if unlabeled
+    label: str  # "bedroom", "livingroom", "diningroom", or "" if unlabeled
     flood_mask: np.ndarray  # boolean mask at raster resolution
     bbox_svg: tuple  # (x, y, w, h) in SVG coordinate space
     unit_id: int | None = None

@@ -52,32 +52,13 @@ class FloodFiller:
                 if len(pts) >= 3 and self._is_closed_polygon(path_coords):
                     cv2.fillPoly(binary, [pts], 0)
 
-        # Step 3: Seal door and window openings with extended barriers
-        # Small perpendicular extension to ensure the barrier fully seals wall gaps
-        barrier_ext_svg = 5.0
+        # Step 3: Seal door and window openings
         for elem in door_elements + window_elements:
             bx, by, bw, bh = elem.bbox
-            # The longer bbox dimension runs along the wall;
-            # extend perpendicular (the shorter dimension) by 2m each side
-            if bw >= bh:
-                # Wall runs horizontally — extend perpendicular (y-axis)
-                ext_by = by - barrier_ext_svg
-                ext_bh = bh + 2 * barrier_ext_svg
-                ext_bx, ext_bw = bx, bw
-            else:
-                # Wall runs vertically — extend perpendicular (x-axis)
-                ext_bx = bx - barrier_ext_svg
-                ext_bw = bw + 2 * barrier_ext_svg
-                ext_by, ext_bh = by, bh
-            px1 = int((ext_bx - self.viewbox[0]) * self.scale)
-            py1 = int((ext_by - self.viewbox[1]) * self.scale)
-            px2 = int(((ext_bx + ext_bw) - self.viewbox[0]) * self.scale)
-            py2 = int(((ext_by + ext_bh) - self.viewbox[1]) * self.scale)
-            # Clamp to raster bounds
-            px1 = max(0, px1)
-            py1 = max(0, py1)
-            px2 = min(self.raster_w - 1, px2)
-            py2 = min(self.raster_h - 1, py2)
+            px1 = int((bx - self.viewbox[0]) * self.scale)
+            py1 = int((by - self.viewbox[1]) * self.scale)
+            px2 = int(((bx + bw) - self.viewbox[0]) * self.scale)
+            py2 = int(((by + bh) - self.viewbox[1]) * self.scale)
             cv2.rectangle(binary, (px1, py1), (px2, py2), 0, -1)
 
         # Step 4: Morphological closing for remaining small gaps
@@ -126,7 +107,7 @@ class FloodFiller:
 
         area = np.sum(room_mask)
         total = self.raster_w * self.raster_h
-        if area < 100 or area > total * 0.8:
+        if area < 100 or area > total * 0.5:
             return None
 
         return room_mask
