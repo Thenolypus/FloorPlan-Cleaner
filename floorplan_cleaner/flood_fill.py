@@ -52,14 +52,18 @@ class FloodFiller:
                 if len(pts) >= 3 and self._is_closed_polygon(path_coords):
                     cv2.fillPoly(binary, [pts], 0)
 
-        # Step 3: Seal door and window openings
+        # Step 3: Seal door and window openings by drawing their SVG paths
+        # identically to walls. The IFC elements contain the actual geometry
+        # (wall cross-sections, frames) so they blend with adjacent walls
+        # at the correct thickness without creating artificial indentations.
         for elem in door_elements + window_elements:
-            bx, by, bw, bh = elem.bbox
-            px1 = int((bx - self.viewbox[0]) * self.scale)
-            py1 = int((by - self.viewbox[1]) * self.scale)
-            px2 = int(((bx + bw) - self.viewbox[0]) * self.scale)
-            py2 = int(((by + bh) - self.viewbox[1]) * self.scale)
-            cv2.rectangle(binary, (px1, py1), (px2, py2), 0, -1)
+            for path_coords in elem.paths:
+                pts = self._coords_to_pixels(path_coords)
+                if len(pts) < 2:
+                    continue
+                cv2.polylines(binary, [pts], isClosed=False, color=0, thickness=4)
+                if len(pts) >= 3 and self._is_closed_polygon(path_coords):
+                    cv2.fillPoly(binary, [pts], 0)
 
         # Step 4: Morphological closing for remaining small gaps
         kernel = np.ones((5, 5), dtype=np.uint8)
@@ -107,7 +111,7 @@ class FloodFiller:
 
         area = np.sum(room_mask)
         total = self.raster_w * self.raster_h
-        if area < 100 or area > total * 0.5:
+        if area < 100 or area > total * 0.8:
             return None
 
         return room_mask
