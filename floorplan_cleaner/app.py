@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
 
         # Room height input
         layout.addWidget(QLabel("Room Height (m):"))
-        self._height_input = QLineEdit("2.8")
+        self._height_input = QLineEdit("2.6")
         layout.addWidget(self._height_input)
 
         # Export button
@@ -323,6 +323,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Exporting...")
 
         exporter = Exporter()
+        door_elements = self._parser.get_doors() if self._parser else None
         exporter.export_all(
             svg_path=self._svg_path,
             input_name=self._input_name,
@@ -331,6 +332,7 @@ class MainWindow(QMainWindow):
             filler=self._filler,
             height_m=height_m,
             output_dir=output_dir,
+            door_elements=door_elements,
         )
 
         self.statusBar().showMessage(f"Export complete: {output_dir}")

@@ -2,11 +2,12 @@ import os
 import re
 import json
 import shutil
+import math
 import numpy as np
 import cv2
 from PIL import Image
 
-from .models import Room, ApartmentUnit
+from .models import Room, ApartmentUnit, IfcElement
 from .flood_fill import FloodFiller
 from .room_splitter import mask_to_contour
 
@@ -45,6 +46,84 @@ def _simplify_contour(contour_px: np.ndarray) -> np.ndarray:
     # use the last result from max epsilon (best we can do without convex hull)
     simplified = cv2.approxPolyDP(contour_f, MAX_EPSILON_PX, closed=True)
     return simplified.reshape(-1, 2)
+
+
+def _find_doors_for_room(
+    room: Room, door_elements: list[IfcElement], filler: FloodFiller
+) -> list[tuple[float, float]]:
+    """Find doors that overlap with a room and return their centroids in SVG coords.
+
+    Dilates the room mask to catch doors sitting in the wall zone.
+    Returns list of (svg_x, svg_y) centroid positions for each matching door.
+    """
+    h, w = room.flood_mask.shape
+    kernel = np.ones((15, 15), dtype=np.uint8)
+    dilated = cv2.dilate(room.flood_mask.astype(np.uint8), kernel) > 0
+
+    centroids = []
+    for elem in door_elements:
+        elem_mask = np.zeros((h, w), dtype=np.uint8)
+        for path_coords in elem.paths:
+            pts = np.array(
+                [(int((x - filler.viewbox[0]) * filler.scale),
+                  int((y - filler.viewbox[1]) * filler.scale))
+                 for x, y in path_coords],
+                dtype=np.int32,
+            )
+            if len(pts) < 2:
+                continue
+            cv2.polylines(elem_mask, [pts], isClosed=False, color=255, thickness=3)
+
+        if int(np.sum((elem_mask > 0) & dilated)) > 0:
+            # Use bbox center as the door centroid in SVG space
+            bx, by, bw, bh = elem.bbox
+            centroids.append((bx + bw / 2, by + bh / 2))
+
+    return centroids
+
+
+def _compute_door_rotation(
+    door_centroids_m: list[tuple[float, float]], center_x: float, center_z: float
+) -> float:
+    """Compute rotation angle (radians) to place the door edge at the bottom (-Z).
+
+    Args:
+        door_centroids_m: Door positions as (x_m, z_m) in meters (before centering).
+        center_x, center_z: The polygon center offset in meters.
+
+    Returns:
+        Rotation angle in radians. 0.0 if no doors found.
+    """
+    if not door_centroids_m:
+        return 0.0
+
+    # Average door position relative to room center
+    avg_dx = sum(d[0] for d in door_centroids_m) / len(door_centroids_m) - center_x
+    avg_dz = sum(d[1] for d in door_centroids_m) / len(door_centroids_m) - center_z
+
+    # Current angle of door direction from center
+    current_angle = math.atan2(avg_dz, avg_dx)
+
+    # We want this direction to point to -Z (angle = -pi/2)
+    rotation = -math.pi / 2 - current_angle
+
+    # Snap to nearest 90-degree multiple to keep axis-aligned edges
+    rotation = round(rotation / (math.pi / 2)) * (math.pi / 2)
+    return rotation
+
+
+def _rotate_vertices(vertices: list[list[float]], angle_rad: float) -> list[list[float]]:
+    """Rotate (x, z) vertices around origin by angle_rad."""
+    if angle_rad == 0.0:
+        return vertices
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    rotated = []
+    for x, z in vertices:
+        rx = x * cos_a - z * sin_a
+        rz = x * sin_a + z * cos_a
+        rotated.append([round(rx, 2), round(rz, 2)])
+    return rotated
 
 
 def _extract_boundary_meters(room: Room, filler: FloodFiller):
@@ -177,6 +256,7 @@ class Exporter:
         filler: FloodFiller,
         height_m: float,
         output_dir: str,
+        door_elements: list[IfcElement] | None = None,
     ):
         base_dir = os.path.join(output_dir, input_name)
         os.makedirs(base_dir, exist_ok=True)
@@ -205,6 +285,18 @@ class Exporter:
                 # Extract boundary polygon in meters, centered at origin
                 vertices_m, (cx, cz) = _extract_boundary_meters(room, filler)
 
+                # Find doors for this room and compute rotation
+                rotation_rad = 0.0
+                if door_elements:
+                    door_centroids_svg = _find_doors_for_room(room, door_elements, filler)
+                    # Convert door SVG centroids to meters (same coord system as vertices)
+                    door_centroids_m = [
+                        (sx * SVG_TO_METERS, -sy * SVG_TO_METERS)
+                        for sx, sy in door_centroids_svg
+                    ]
+                    rotation_rad = _compute_door_rotation(door_centroids_m, cx, cz)
+                    vertices_m = _rotate_vertices(vertices_m, rotation_rad)
+
                 # Build bounds_top and bounds_bottom
                 # X = SVG x, Y = up (height), Z = -SVG y
                 bounds_top = [[v[0], height_m, v[1]] for v in vertices_m]
@@ -226,7 +318,7 @@ class Exporter:
                 with open(filepath, "w") as f:
                     json.dump(ssr, f, indent=4)
 
-                print(f"Saved: {filepath} | vertices: {len(vertices_m)}")
+                print(f"Saved: {filepath} | vertices: {len(vertices_m)} | rotation: {math.degrees(rotation_rad):.1f} deg")
 
                 # Metadata keeps the original label for reconstruction
                 room_entry = {
@@ -237,6 +329,7 @@ class Exporter:
                         "x": round(cx, 2),
                         "z": round(cz, 2),
                     },
+                    "rotation_rad": round(rotation_rad, 6),
                     "bbox_in_svg": {
                         "x": round(room.bbox_svg[0], 2),
                         "y": round(room.bbox_svg[1], 2),
