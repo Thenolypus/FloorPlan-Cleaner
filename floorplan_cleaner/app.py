@@ -16,7 +16,7 @@ from .preprocess import center_svg
 from .models import Room, ApartmentUnit
 
 
-ROOM_TYPES = ["bedroom", "livingroom/diningroom", "all", "bathroom", "balcony"]
+ROOM_TYPES = ["bedroom", "livingroom", "diningroom", "all", "bathroom", "balcony"]
 TARGET_LONGEST_SIDE = 2000
 
 
@@ -324,6 +324,7 @@ class MainWindow(QMainWindow):
 
         exporter = Exporter()
         door_elements = self._parser.get_doors() if self._parser else None
+        window_elements = self._parser.get_windows() if self._parser else None
         exporter.export_all(
             svg_path=self._svg_path,
             input_name=self._input_name,
@@ -333,6 +334,7 @@ class MainWindow(QMainWindow):
             height_m=height_m,
             output_dir=output_dir,
             door_elements=door_elements,
+            window_elements=window_elements,
         )
 
         self.statusBar().showMessage(f"Export complete: {output_dir}")

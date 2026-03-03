@@ -26,6 +26,45 @@ MAX_EPSILON_PX = 30.0
 # Margin around unit bbox for overview SVG (in SVG units)
 OVERVIEW_MARGIN_SVG = 5.0
 
+# Max perpendicular distance (meters) for a vertex to be considered collinear
+COLLINEAR_THRESHOLD_M = 0.20
+
+
+def _remove_collinear(vertices_m: list[list[float]], threshold: float = COLLINEAR_THRESHOLD_M) -> list[list[float]]:
+    """Remove vertices that are nearly collinear with their neighbors.
+
+    For each vertex, compute its perpendicular distance to the line segment
+    formed by its predecessor and successor. If below threshold, remove it.
+    Iterates until no more removals occur.
+    """
+    pts = [v[:] for v in vertices_m]
+    changed = True
+    while changed:
+        changed = False
+        if len(pts) <= 4:
+            break
+        keep = []
+        n = len(pts)
+        for i in range(n):
+            prev = np.array(pts[(i - 1) % n])
+            curr = np.array(pts[i])
+            nxt = np.array(pts[(i + 1) % n])
+
+            edge = nxt - prev
+            edge_len = np.linalg.norm(edge)
+            if edge_len < 1e-9:
+                keep.append(pts[i])
+                continue
+
+            # Perpendicular distance from curr to line(prev, nxt)
+            dist = abs(np.cross(edge, curr - prev)) / edge_len
+            if dist >= threshold:
+                keep.append(pts[i])
+            else:
+                changed = True
+        pts = keep
+    return pts
+
 
 def _simplify_contour(contour_px: np.ndarray) -> np.ndarray:
     """Simplify a contour to at most MAX_VERTICES vertices.
@@ -48,38 +87,50 @@ def _simplify_contour(contour_px: np.ndarray) -> np.ndarray:
     return simplified.reshape(-1, 2)
 
 
-def _find_doors_for_room(
-    room: Room, door_elements: list[IfcElement], filler: FloodFiller
-) -> list[tuple[float, float]]:
-    """Find doors that overlap with a room and return their centroids in SVG coords.
+def _find_openings_for_room(
+    room: Room,
+    door_elements: list[IfcElement],
+    window_elements: list[IfcElement],
+    filler: FloodFiller,
+) -> list[dict]:
+    """Find doors and windows that overlap with a room.
 
-    Dilates the room mask to catch doors sitting in the wall zone.
-    Returns list of (svg_x, svg_y) centroid positions for each matching door.
+    Dilates the room mask to catch openings sitting in the wall zone.
+    Returns list of dicts with 'type' and 'bbox' (x, y, w, h) in SVG coords.
     """
     h, w = room.flood_mask.shape
     kernel = np.ones((15, 15), dtype=np.uint8)
     dilated = cv2.dilate(room.flood_mask.astype(np.uint8), kernel) > 0
 
-    centroids = []
-    for elem in door_elements:
-        elem_mask = np.zeros((h, w), dtype=np.uint8)
-        for path_coords in elem.paths:
-            pts = np.array(
-                [(int((x - filler.viewbox[0]) * filler.scale),
-                  int((y - filler.viewbox[1]) * filler.scale))
-                 for x, y in path_coords],
-                dtype=np.int32,
-            )
-            if len(pts) < 2:
+    openings = []
+    seen_guids = set()
+    for opening_type, elements in [("door", door_elements), ("window", window_elements)]:
+        for elem in elements:
+            # Deduplicate by IFC GUID (same object has projection + cut layers)
+            if elem.ifc_guid and elem.ifc_guid in seen_guids:
                 continue
-            cv2.polylines(elem_mask, [pts], isClosed=False, color=255, thickness=3)
 
-        if int(np.sum((elem_mask > 0) & dilated)) > 0:
-            # Use bbox center as the door centroid in SVG space
-            bx, by, bw, bh = elem.bbox
-            centroids.append((bx + bw / 2, by + bh / 2))
+            elem_mask = np.zeros((h, w), dtype=np.uint8)
+            for path_coords in elem.paths:
+                pts = np.array(
+                    [(int((x - filler.viewbox[0]) * filler.scale),
+                      int((y - filler.viewbox[1]) * filler.scale))
+                     for x, y in path_coords],
+                    dtype=np.int32,
+                )
+                if len(pts) < 2:
+                    continue
+                cv2.polylines(elem_mask, [pts], isClosed=False, color=255, thickness=3)
 
-    return centroids
+            if int(np.sum((elem_mask > 0) & dilated)) > 0:
+                if elem.ifc_guid:
+                    seen_guids.add(elem.ifc_guid)
+                openings.append({
+                    "type": opening_type,
+                    "bbox_svg": elem.bbox,  # (x, y, w, h) in SVG coords
+                })
+
+    return openings
 
 
 def _compute_door_rotation(
@@ -126,6 +177,65 @@ def _rotate_vertices(vertices: list[list[float]], angle_rad: float) -> list[list
     return rotated
 
 
+# Default opening dimensions (meters) for values we can't extract from 2D SVG
+WALL_THICKNESS_M = 0.24
+DEFAULT_WINDOW_SILL_M = 0.90   # bottom of window above floor
+DEFAULT_WINDOW_HEIGHT_M = 1.40
+DEFAULT_DOOR_HEIGHT_M = 2.10
+
+
+def _openings_to_3d(
+    openings: list[dict],
+    center_offset: tuple[float, float],
+    rotation_rad: float,
+) -> list[dict]:
+    """Convert opening SVG bboxes to 3D pos/size in the room's local coordinate system.
+
+    Uses the same centering and rotation applied to room vertices.
+    Returns list of {"type", "pos": [x, y, z], "size": [sx, sy, sz]}.
+    """
+    cx, cz = center_offset
+    result = []
+    for op in openings:
+        bx, by, bw, bh = op["bbox_svg"]
+
+        # SVG bbox center -> meters (SVG x -> X, SVG y -> -Z)
+        mx = (bx + bw / 2) * SVG_TO_METERS - cx
+        mz = -(by + bh / 2) * SVG_TO_METERS - cz
+
+        # Size in meters (SVG width -> X extent, SVG height -> Z extent)
+        sx = bw * SVG_TO_METERS
+        sz = bh * SVG_TO_METERS
+
+        # Apply room rotation to the position
+        if rotation_rad != 0.0:
+            cos_a = math.cos(rotation_rad)
+            sin_a = math.sin(rotation_rad)
+            rx = mx * cos_a - mz * sin_a
+            rz = mx * sin_a + mz * cos_a
+            mx, mz = rx, rz
+            # For 90-degree snapped rotations, swap sx/sz when rotated by odd multiples
+            steps = round(rotation_rad / (math.pi / 2)) % 4
+            if steps in (1, 3):
+                sx, sz = sz, sx
+
+        # Vertical placement depends on opening type
+        if op["type"] == "window":
+            y_center = DEFAULT_WINDOW_SILL_M + DEFAULT_WINDOW_HEIGHT_M / 2
+            sy = DEFAULT_WINDOW_HEIGHT_M
+        else:  # door
+            y_center = DEFAULT_DOOR_HEIGHT_M / 2
+            sy = DEFAULT_DOOR_HEIGHT_M
+
+        result.append({
+            "type": op["type"],
+            "pos": [round(mx, 2), round(y_center, 2), round(mz, 2)],
+            "size": [round(sx, 2), round(sy, 2), round(sz, 2)],
+        })
+
+    return result
+
+
 def _extract_boundary_meters(room: Room, filler: FloodFiller):
     """Extract room contour as polygon vertices in meters, centered at origin.
 
@@ -159,14 +269,15 @@ def _extract_boundary_meters(room: Room, filler: FloodFiller):
 
     vertices_m = np.round(vertices_m, 2).tolist()
 
+    # Remove near-collinear vertices (door/window recess artifacts)
+    vertices_m = _remove_collinear(vertices_m)
+
     return vertices_m, (cx, cz)
 
 
 def _map_room_type_for_output(label: str) -> str:
     """Map internal label to ReSpace room_type for the per-room JSON."""
-    if label == "livingroom/diningroom":
-        return "livingroom"
-    elif label in ("bedroom", "all", "bathroom", "balcony"):
+    if label in ("bedroom", "livingroom", "diningroom", "all", "bathroom", "balcony"):
         return label
     else:
         return "all"
@@ -257,6 +368,7 @@ class Exporter:
         height_m: float,
         output_dir: str,
         door_elements: list[IfcElement] | None = None,
+        window_elements: list[IfcElement] | None = None,
     ):
         base_dir = os.path.join(output_dir, input_name)
         os.makedirs(base_dir, exist_ok=True)
@@ -285,17 +397,32 @@ class Exporter:
                 # Extract boundary polygon in meters, centered at origin
                 vertices_m, (cx, cz) = _extract_boundary_meters(room, filler)
 
-                # Find doors for this room and compute rotation
-                rotation_rad = 0.0
-                if door_elements:
-                    door_centroids_svg = _find_doors_for_room(room, door_elements, filler)
-                    # Convert door SVG centroids to meters (same coord system as vertices)
-                    door_centroids_m = [
-                        (sx * SVG_TO_METERS, -sy * SVG_TO_METERS)
-                        for sx, sy in door_centroids_svg
-                    ]
-                    rotation_rad = _compute_door_rotation(door_centroids_m, cx, cz)
+                # Find openings (doors + windows) for this room
+                room_openings = _find_openings_for_room(
+                    room,
+                    door_elements or [],
+                    window_elements or [],
+                    filler,
+                )
+
+                # Extract door centroids for rotation computation
+                door_centroids_m = []
+                for op in room_openings:
+                    if op["type"] == "door":
+                        bx, by, bw, bh = op["bbox_svg"]
+                        door_centroids_m.append((
+                            (bx + bw / 2) * SVG_TO_METERS,
+                            -(by + bh / 2) * SVG_TO_METERS,
+                        ))
+
+                rotation_rad = _compute_door_rotation(door_centroids_m, cx, cz)
+                if rotation_rad != 0.0:
                     vertices_m = _rotate_vertices(vertices_m, rotation_rad)
+
+                # Convert openings to 3D in room-local coords
+                openings_3d = _openings_to_3d(
+                    room_openings, (cx, cz), rotation_rad,
+                )
 
                 # Build bounds_top and bounds_bottom
                 # X = SVG x, Y = up (height), Z = -SVG y
@@ -307,6 +434,7 @@ class Exporter:
                     "bounds_top": bounds_top,
                     "bounds_bottom": bounds_bottom,
                     "objects": [],
+                    "openings": openings_3d,
                 }
 
                 # Use the output room type for the filename
@@ -318,7 +446,9 @@ class Exporter:
                 with open(filepath, "w") as f:
                     json.dump(ssr, f, indent=4)
 
-                print(f"Saved: {filepath} | vertices: {len(vertices_m)} | rotation: {math.degrees(rotation_rad):.1f} deg")
+                n_doors = sum(1 for o in openings_3d if o["type"] == "door")
+                n_windows = sum(1 for o in openings_3d if o["type"] == "window")
+                print(f"Saved: {filepath} | vertices: {len(vertices_m)} | rotation: {math.degrees(rotation_rad):.1f} deg | doors: {n_doors} | windows: {n_windows}")
 
                 # Metadata keeps the original label for reconstruction
                 room_entry = {
