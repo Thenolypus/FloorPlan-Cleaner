@@ -14,6 +14,7 @@ from .flood_fill import FloodFiller
 from .export import Exporter
 from .preprocess import center_svg
 from .models import Room, ApartmentUnit
+from .room_splitter import simplify_contour_for_extend
 
 
 ROOM_TYPES = ["bedroom", "livingroom", "diningroom", "all", "bathroom", "balcony"]
@@ -41,6 +42,7 @@ class MainWindow(QMainWindow):
         self._canvas = FloorPlanCanvas()
         self.setCentralWidget(self._canvas)
         self._canvas.room_clicked.connect(self._on_room_clicked)
+        self._canvas.boundary_extend_confirmed.connect(self._on_boundary_extended)
 
         # Sidebar
         self._setup_sidebar()
@@ -94,6 +96,11 @@ class MainWindow(QMainWindow):
         delete_btn = QPushButton("Delete Room")
         delete_btn.clicked.connect(self._delete_room)
         layout.addWidget(delete_btn)
+
+        # Extend boundary button
+        extend_btn = QPushButton("Extend Boundary")
+        extend_btn.clicked.connect(self._extend_boundary)
+        layout.addWidget(extend_btn)
 
         # Separator
         layout.addWidget(self._make_separator())
@@ -362,3 +369,52 @@ class MainWindow(QMainWindow):
             if r.id == room_id:
                 return r
         return None
+
+    # --- Boundary extension ---
+
+    def _extend_boundary(self):
+        current_item = self._room_list.currentItem()
+        if current_item is None:
+            self.statusBar().showMessage("Select a room first.")
+            return
+
+        room_id = current_item.data(Qt.ItemDataRole.UserRole)
+        room = self._find_room(room_id)
+        if room is None or room.unit_id is not None:
+            self.statusBar().showMessage("Cannot extend a saved room.")
+            return
+
+        contour = simplify_contour_for_extend(room.flood_mask)
+        self._canvas.enter_extend_mode(room_id, contour, room.flood_mask)
+        self.statusBar().showMessage(
+            "Click on a room edge to select it. Drag to extend. Click again to confirm. Esc to cancel."
+        )
+
+    def _on_boundary_extended(self, room_id: int, new_mask, ext_info: dict):
+        room = self._find_room(room_id)
+        if room is None:
+            return
+
+        room.flood_mask = new_mask
+
+        # Recompute SVG bbox
+        ys, xs = new_mask.nonzero()
+        svg_x, svg_y = self._filler.pixel_to_svg(int(xs.min()), int(ys.min()))
+        svg_x2, svg_y2 = self._filler.pixel_to_svg(int(xs.max()), int(ys.max()))
+        room.bbox_svg = (svg_x, svg_y, svg_x2 - svg_x, svg_y2 - svg_y)
+
+        # Store extension geometry in SVG coords so export can shift openings
+        p1_svg = self._filler.pixel_to_svg(*ext_info["edge_p1_px"])
+        p2_svg = self._filler.pixel_to_svg(*ext_info["edge_p2_px"])
+        room.boundary_extensions.append({
+            "edge_p1_svg": p1_svg,
+            "edge_p2_svg": p2_svg,
+            "normal_svg": ext_info["normal"],  # direction is the same in SVG space
+            "offset_svg": ext_info["offset_px"] / self._scale,
+        })
+
+        # Update overlay
+        color = LABELED_ROOM_COLOR if room.label else SELECTED_ROOM_COLOR
+        self._canvas.add_room_overlay(room_id, new_mask, color=color)
+
+        self.statusBar().showMessage("Boundary extended.")

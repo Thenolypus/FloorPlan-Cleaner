@@ -1,7 +1,10 @@
+import math
 import numpy as np
+import cv2
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QLineF
 from PySide6.QtGui import (
     QImage, QPixmap, QColor, QPainter, QWheelEvent, QMouseEvent, QPen,
+    QPolygonF, QBrush,
 )
 from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
@@ -9,7 +12,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtSvg import QSvgRenderer
 
-from .room_splitter import snap_to_contour
+from .room_splitter import (
+    snap_to_contour, find_nearest_edge, compute_outward_normal,
+)
 
 
 # Colors for room overlays, cycled per unit
@@ -34,6 +39,7 @@ SPLIT_HALF_B_COLOR = QColor(200, 0, 200, 100)     # magenta
 class FloorPlanCanvas(QGraphicsView):
     room_clicked = Signal(int, int)  # pixel x, y on the raster image
     split_line_complete = Signal(int, int, int, int)  # p1x, p1y, p2x, p2y
+    boundary_extend_confirmed = Signal(int, object, dict)  # room_id, new_mask, extension_info
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,6 +71,24 @@ class FloorPlanCanvas(QGraphicsView):
         self._split_final_line: QGraphicsLineItem | None = None
         self._split_point_items: list[QGraphicsEllipseItem] = []
         self._split_half_overlays: dict[str, QGraphicsPixmapItem] = {}
+
+        # Extend-boundary state
+        self._extend_mode = False
+        self._extend_state = "IDLE"  # "IDLE" | "EDGE_SELECTED" | "DRAGGING"
+        self._extend_room_id: int | None = None
+        self._extend_contour: np.ndarray | None = None       # simplified polygon (Nx2)
+        self._extend_original_contour: np.ndarray | None = None
+        self._extend_original_mask: np.ndarray | None = None
+        self._extend_edge_idx: int = -1
+        self._extend_normal: tuple[float, float] = (0.0, 0.0)
+        self._extend_total_offset: float = 0.0
+        self._extend_drag_start_offset: float = 0.0
+        self._extend_press_pos: tuple[int, int] | None = None
+
+        # Extend graphics items
+        self._extend_edge_line: QGraphicsLineItem | None = None
+        self._extend_new_edge_line: QGraphicsLineItem | None = None
+        self._extend_quad_item = None  # QGraphicsPolygonItem
 
         # Enable mouse tracking for live preview line
         self.setMouseTracking(True)
@@ -225,6 +249,137 @@ class FloorPlanCanvas(QGraphicsView):
         dot.setZValue(3)
         self._split_point_items.append(dot)
 
+    # --- Extend-boundary mode methods ---
+
+    def enter_extend_mode(self, room_id: int, contour: np.ndarray, mask: np.ndarray):
+        """Enter boundary extension mode for *room_id*."""
+        self._extend_mode = True
+        self._extend_state = "IDLE"
+        self._extend_room_id = room_id
+        self._extend_contour = contour.copy()
+        self._extend_original_contour = contour.copy()
+        self._extend_original_mask = mask.copy()
+        self._extend_edge_idx = -1
+        self._extend_normal = (0.0, 0.0)
+        self._extend_total_offset = 0.0
+        self._extend_press_pos = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def exit_extend_mode(self):
+        """Exit extend mode and clean up graphics."""
+        self._extend_mode = False
+        self._extend_state = "IDLE"
+        self._extend_room_id = None
+        self._extend_contour = None
+        self._extend_original_contour = None
+        self._extend_original_mask = None
+        self._extend_edge_idx = -1
+        self._clear_extend_graphics()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _clear_extend_graphics(self):
+        for item in (self._extend_edge_line, self._extend_new_edge_line, self._extend_quad_item):
+            if item is not None:
+                self._scene.removeItem(item)
+        self._extend_edge_line = None
+        self._extend_new_edge_line = None
+        self._extend_quad_item = None
+
+    def _highlight_extend_edge(self):
+        """Draw the selected edge as a thick cyan line."""
+        idx = self._extend_edge_idx
+        n = len(self._extend_contour)
+        p1 = self._extend_contour[idx]
+        p2 = self._extend_contour[(idx + 1) % n]
+
+        line = QLineF(QPointF(float(p1[0]), float(p1[1])),
+                       QPointF(float(p2[0]), float(p2[1])))
+        pen = QPen(QColor(0, 200, 200), 3)
+        if self._extend_edge_line is not None:
+            self._scene.removeItem(self._extend_edge_line)
+        self._extend_edge_line = self._scene.addLine(line, pen)
+        self._extend_edge_line.setZValue(4)
+
+    def _update_extend_preview(self, offset: float):
+        """Show the quad between original and moved edge, plus the new edge line."""
+        idx = self._extend_edge_idx
+        n = len(self._extend_original_contour)
+        normal = np.array(self._extend_normal)
+
+        op1 = self._extend_original_contour[idx].astype(np.float64)
+        op2 = self._extend_original_contour[(idx + 1) % n].astype(np.float64)
+        np1 = op1 + normal * offset
+        np2 = op2 + normal * offset
+
+        # Quad preview
+        quad_poly = QPolygonF([
+            QPointF(float(op1[0]), float(op1[1])),
+            QPointF(float(op2[0]), float(op2[1])),
+            QPointF(float(np2[0]), float(np2[1])),
+            QPointF(float(np1[0]), float(np1[1])),
+        ])
+        color = QColor(0, 200, 0, 60) if offset >= 0 else QColor(200, 0, 0, 60)
+        pen = QPen(Qt.PenStyle.NoPen)
+        brush = QBrush(color)
+        if self._extend_quad_item is not None:
+            self._extend_quad_item.setPolygon(quad_poly)
+            self._extend_quad_item.setBrush(brush)
+        else:
+            self._extend_quad_item = self._scene.addPolygon(quad_poly, pen, brush)
+            self._extend_quad_item.setZValue(3)
+
+        # New edge line
+        new_line = QLineF(QPointF(float(np1[0]), float(np1[1])),
+                          QPointF(float(np2[0]), float(np2[1])))
+        edge_pen = QPen(QColor(0, 200, 200), 2, Qt.PenStyle.DashLine)
+        if self._extend_new_edge_line is not None:
+            self._extend_new_edge_line.setLine(new_line)
+        else:
+            self._extend_new_edge_line = self._scene.addLine(new_line, edge_pen)
+            self._extend_new_edge_line.setZValue(4)
+
+    def _compute_extended_mask(self) -> np.ndarray:
+        """Create the new mask by unioning/subtracting the extension quad."""
+        h, w = self._extend_original_mask.shape
+        idx = self._extend_edge_idx
+        n = len(self._extend_original_contour)
+        normal = np.array(self._extend_normal)
+        offset = self._extend_total_offset
+
+        op1 = self._extend_original_contour[idx].astype(np.float64)
+        op2 = self._extend_original_contour[(idx + 1) % n].astype(np.float64)
+        np1 = op1 + normal * offset
+        np2 = op2 + normal * offset
+
+        quad = np.array([op1, op2, np2, np1], dtype=np.int32)
+        quad_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(quad_mask, [quad], 255)
+
+        if offset >= 0:
+            return self._extend_original_mask | (quad_mask > 0)
+        else:
+            return self._extend_original_mask & ~(quad_mask > 0)
+
+    def _confirm_extend(self):
+        """Apply extension and emit signal."""
+        if abs(self._extend_total_offset) < 1.0:
+            # No meaningful change
+            self.exit_extend_mode()
+            return
+        new_mask = self._compute_extended_mask()
+        room_id = self._extend_room_id
+        idx = self._extend_edge_idx
+        n = len(self._extend_original_contour)
+        ext_info = {
+            "edge_p1_px": tuple(self._extend_original_contour[idx].tolist()),
+            "edge_p2_px": tuple(self._extend_original_contour[(idx + 1) % n].tolist()),
+            "normal": self._extend_normal,
+            "offset_px": self._extend_total_offset,
+        }
+        self._clear_extend_graphics()
+        self.exit_extend_mode()
+        self.boundary_extend_confirmed.emit(room_id, new_mask, ext_info)
+
     # --- Event handlers ---
 
     def wheelEvent(self, event: QWheelEvent):
@@ -296,6 +451,31 @@ class FloorPlanCanvas(QGraphicsView):
                 event.accept()
                 return
 
+            # Extend-boundary mode
+            if self._extend_mode and self._extend_contour is not None:
+                if self._extend_state == "IDLE":
+                    edge_idx, dist = find_nearest_edge(px, py, self._extend_contour)
+                    if dist < 15:
+                        self._extend_edge_idx = edge_idx
+                        self._extend_normal = compute_outward_normal(
+                            self._extend_contour, edge_idx, self._extend_original_mask,
+                        )
+                        self._extend_state = "EDGE_SELECTED"
+                        self._extend_total_offset = 0.0
+                        self._highlight_extend_edge()
+                    event.accept()
+                    return
+
+                elif self._extend_state == "EDGE_SELECTED":
+                    self._extend_press_pos = (px, py)
+                    self._extend_drag_start_offset = self._extend_total_offset
+                    self._extend_state = "DRAGGING"
+                    event.accept()
+                    return
+
+                event.accept()
+                return
+
             # Normal room selection
             self.room_clicked.emit(px, py)
             event.accept()
@@ -335,16 +515,55 @@ class FloorPlanCanvas(QGraphicsView):
             event.accept()
             return
 
+        # Extend-boundary dragging
+        if (self._extend_mode and self._extend_state == "DRAGGING"
+                and self._extend_press_pos is not None):
+            scene_pos = self.mapToScene(event.position().toPoint())
+            mx = int(scene_pos.x())
+            my = int(scene_pos.y())
+            dx = mx - self._extend_press_pos[0]
+            dy = my - self._extend_press_pos[1]
+            drag_offset = dx * self._extend_normal[0] + dy * self._extend_normal[1]
+            self._extend_total_offset = self._extend_drag_start_offset + drag_offset
+            self._update_extend_preview(self._extend_total_offset)
+            event.accept()
+            return
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.RightButton and self._panning:
             self._panning = False
             self._pan_start = None
-            if self._split_mode:
+            if self._split_mode or self._extend_mode:
                 self.setCursor(Qt.CursorShape.CrossCursor)
             else:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
             event.accept()
             return
+
+        if event.button() == Qt.MouseButton.LeftButton and self._extend_mode:
+            if self._extend_state == "DRAGGING" and self._extend_press_pos is not None:
+                scene_pos = self.mapToScene(event.position().toPoint())
+                rx, ry = int(scene_pos.x()), int(scene_pos.y())
+                dist = math.sqrt(
+                    (rx - self._extend_press_pos[0]) ** 2
+                    + (ry - self._extend_press_pos[1]) ** 2
+                )
+                if dist < 5:
+                    # Click (no significant drag) → confirm
+                    self._confirm_extend()
+                else:
+                    # Drag completed, keep preview, wait for confirm click
+                    self._extend_state = "EDGE_SELECTED"
+                event.accept()
+                return
+
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self._extend_mode:
+            self.exit_extend_mode()
+            event.accept()
+            return
+        super().keyPressEvent(event)

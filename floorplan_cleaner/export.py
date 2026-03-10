@@ -123,14 +123,119 @@ def _find_openings_for_room(
                 cv2.polylines(elem_mask, [pts], isClosed=False, color=255, thickness=3)
 
             if int(np.sum((elem_mask > 0) & dilated)) > 0:
+                # Filter out tiny SVG fragments that aren't real openings
+                _, _, ew, eh = elem.bbox
+                if max(ew * SVG_TO_METERS, eh * SVG_TO_METERS) < MIN_OPENING_SIZE_M:
+                    continue
+                if min(ew * SVG_TO_METERS, eh * SVG_TO_METERS) < MIN_OPENING_DEPTH_M:
+                    continue
                 if elem.ifc_guid:
                     seen_guids.add(elem.ifc_guid)
                 openings.append({
                     "type": opening_type,
                     "bbox_svg": elem.bbox,  # (x, y, w, h) in SVG coords
+                    "ifc_guid": elem.ifc_guid,
                 })
 
     return openings
+
+
+def _bbox_overlap(a: tuple, b: tuple) -> float:
+    """Return intersection-over-minimum-area ratio for two (x, y, w, h) bboxes."""
+    ax, ay, aw, ah = a
+    bx, by, bww, bh = b
+    ix1 = max(ax, bx)
+    iy1 = max(ay, by)
+    ix2 = min(ax + aw, bx + bww)
+    iy2 = min(ay + ah, by + bh)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    min_area = min(aw * ah, bww * bh)
+    if min_area < 1e-9:
+        return 0.0
+    return inter / min_area
+
+
+# Minimum IoMin overlap ratio to consider two openings as the same physical object
+BBOX_OVERLAP_THRESHOLD = 0.5
+
+
+def _dedup_openings_across_rooms(
+    all_room_openings: list[list[dict]],
+    rooms: list[Room],
+    filler,
+) -> list[list[dict]]:
+    """Deduplicate openings across rooms in a unit.
+
+    1. GUID dedup: if the same ifc_guid appears in multiple rooms, assign it
+       to the room whose mask boundary is closest to the opening center.
+    2. Spatial dedup: if two openings (different GUIDs) have heavily overlapping
+       bboxes, keep only the one with the larger bbox.
+    """
+    # --- Step 1: cross-room GUID dedup ---
+    # Map guid -> list of (room_idx, opening_idx)
+    guid_locations: dict[str, list[tuple[int, int]]] = {}
+    for ri, openings in enumerate(all_room_openings):
+        for oi, op in enumerate(openings):
+            guid = op.get("ifc_guid")
+            if guid:
+                guid_locations.setdefault(guid, []).append((ri, oi))
+
+    remove_set: set[tuple[int, int]] = set()
+    for guid, locs in guid_locations.items():
+        if len(locs) <= 1:
+            continue
+        # Find the opening's SVG center
+        ri0, oi0 = locs[0]
+        bx, by, bw, bh = all_room_openings[ri0][oi0]["bbox_svg"]
+        ocx = int((bx - filler.viewbox[0]) * filler.scale + bw * filler.scale / 2)
+        ocy = int((by - filler.viewbox[1]) * filler.scale + bh * filler.scale / 2)
+
+        # Find the room whose mask boundary is closest
+        best_ri = locs[0][0]
+        best_dist = float("inf")
+        for ri, _ in locs:
+            mask = rooms[ri].flood_mask
+            contour = mask_to_contour(mask)
+            if len(contour) == 0:
+                continue
+            dists = np.sqrt((contour[:, 0] - ocx) ** 2 + (contour[:, 1] - ocy) ** 2)
+            d = float(dists.min())
+            if d < best_dist:
+                best_dist = d
+                best_ri = ri
+
+        for ri, oi in locs:
+            if ri != best_ri:
+                remove_set.add((ri, oi))
+
+    # --- Step 2: spatial dedup within each room ---
+    result = []
+    for ri, openings in enumerate(all_room_openings):
+        kept = []
+        for oi, op in enumerate(openings):
+            if (ri, oi) in remove_set:
+                continue
+            # Check against already-kept openings for spatial overlap
+            dominated = False
+            for ki, kop in enumerate(kept):
+                if op["type"] != kop["type"]:
+                    continue
+                overlap = _bbox_overlap(op["bbox_svg"], kop["bbox_svg"])
+                if overlap >= BBOX_OVERLAP_THRESHOLD:
+                    # Keep the one with the larger bbox area
+                    op_area = op["bbox_svg"][2] * op["bbox_svg"][3]
+                    kop_area = kop["bbox_svg"][2] * kop["bbox_svg"][3]
+                    if op_area > kop_area:
+                        kept[ki] = op  # replace with larger
+                    dominated = True
+                    break
+            if not dominated:
+                kept.append(op)
+        result.append(kept)
+
+    return result
 
 
 def _compute_door_rotation(
@@ -175,6 +280,73 @@ def _rotate_vertices(vertices: list[list[float]], angle_rad: float) -> list[list
         rz = x * sin_a + z * cos_a
         rotated.append([round(rx, 2), round(rz, 2)])
     return rotated
+
+
+# Minimum opening dimension in meters (filter out SVG path fragments)
+MIN_OPENING_SIZE_M = 0.30
+# Minimum depth/thickness in meters (filter out thin line fragments)
+MIN_OPENING_DEPTH_M = 0.05
+
+# Max perpendicular distance (SVG units) for an opening to be considered on an edge
+OPENING_EDGE_DIST_SVG = 5.0
+
+
+def _apply_boundary_extensions_to_openings(
+    openings: list[dict],
+    boundary_extensions: list[dict],
+) -> list[dict]:
+    """Shift openings that lie on extended edges by the extension offset.
+
+    For each boundary extension, find openings whose bbox center is close to
+    the extended edge segment, and translate their bbox by normal * offset.
+    """
+    if not boundary_extensions:
+        return openings
+
+    result = []
+    for op in openings:
+        bx, by, bw, bh = op["bbox_svg"]
+        cx = bx + bw / 2
+        cy = by + bh / 2
+        center = np.array([cx, cy])
+
+        dx_total = 0.0
+        dy_total = 0.0
+
+        for ext in boundary_extensions:
+            p1 = np.array(ext["edge_p1_svg"])
+            p2 = np.array(ext["edge_p2_svg"])
+            normal = np.array(ext["normal_svg"])
+            offset = ext["offset_svg"]
+
+            edge = p2 - p1
+            edge_len = np.linalg.norm(edge)
+            if edge_len < 1e-9:
+                continue
+
+            # Project opening center onto the edge line
+            t = np.dot(center - p1, edge) / (edge_len * edge_len)
+
+            # Allow some overshoot at endpoints (half of bbox extent)
+            half_extent = max(bw, bh) / 2
+            t_margin = half_extent / edge_len
+            if t < -t_margin or t > 1.0 + t_margin:
+                continue
+
+            # Perpendicular distance from center to the edge line
+            closest = p1 + t * edge
+            perp_dist = np.linalg.norm(center - closest)
+
+            if perp_dist <= OPENING_EDGE_DIST_SVG:
+                dx_total += normal[0] * offset
+                dy_total += normal[1] * offset
+
+        result.append({
+            "type": op["type"],
+            "bbox_svg": (bx + dx_total, by + dy_total, bw, bh),
+        })
+
+    return result
 
 
 # Default opening dimensions (meters) for values we can't extract from 2D SVG
@@ -292,8 +464,13 @@ def _compute_unit_bbox_svg(unit_rooms: list[Room]) -> tuple[float, float, float,
     return (min_x, min_y, max_x - min_x, max_y - min_y)
 
 
-def _export_unit_svg(svg_path: str, unit_rooms: list[Room], output_path: str):
-    """Export a cropped SVG showing only the unit's area."""
+def _export_unit_svg(
+    svg_path: str,
+    unit_rooms: list[Room],
+    output_path: str,
+    filler: FloodFiller | None = None,
+):
+    """Export a cropped SVG showing only the unit's area, with room boundary outlines."""
     with open(svg_path, "r", encoding="utf-8") as f:
         svg_text = f.read()
 
@@ -311,6 +488,33 @@ def _export_unit_svg(svg_path: str, unit_rooms: list[Room], output_path: str):
     if re.search(r'width="[\d.]+mm"', svg_text):
         svg_text = re.sub(r'width="[\d.]+mm"', f'width="{new_vb_w}mm"', svg_text)
         svg_text = re.sub(r'height="[\d.]+mm"', f'height="{new_vb_h}mm"', svg_text)
+
+    # Inject room boundary outlines
+    if filler is not None:
+        colors = ["#64b4ff", "#64ff96", "#ffb464", "#c882ff", "#ffff64", "#ff8282"]
+        outlines = ""
+        for i, room in enumerate(unit_rooms):
+            contour = mask_to_contour(room.flood_mask)
+            contour_f = contour.astype(np.float32).reshape(-1, 1, 2)
+            simplified = cv2.approxPolyDP(contour_f, 3.0, closed=True).reshape(-1, 2)
+
+            points_svg = []
+            for px, py in simplified:
+                sx, sy = filler.pixel_to_svg(int(px), int(py))
+                points_svg.append(f"{sx:.2f},{sy:.2f}")
+
+            pts_str = " ".join(points_svg)
+            color = colors[i % len(colors)]
+            outlines += (
+                f'  <polygon points="{pts_str}" '
+                f'fill="{color}" fill-opacity="0.15" '
+                f'stroke="{color}" stroke-width="0.5" />\n'
+            )
+
+        svg_text = svg_text.replace(
+            "</svg>",
+            f'<g id="room-outlines">\n{outlines}</g>\n</svg>',
+        )
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(svg_text)
@@ -391,19 +595,30 @@ class Exporter:
                 "rooms": [],
             }
 
-            for room_idx, room in enumerate(unit_rooms, start=1):
-                output_room_type = _map_room_type_for_output(room.label)
-
-                # Extract boundary polygon in meters, centered at origin
-                vertices_m, (cx, cz) = _extract_boundary_meters(room, filler)
-
-                # Find openings (doors + windows) for this room
+            # Collect openings for all rooms, then deduplicate across rooms
+            all_room_openings = []
+            for room in unit_rooms:
                 room_openings = _find_openings_for_room(
                     room,
                     door_elements or [],
                     window_elements or [],
                     filler,
                 )
+                room_openings = _apply_boundary_extensions_to_openings(
+                    room_openings, room.boundary_extensions,
+                )
+                all_room_openings.append(room_openings)
+            all_room_openings = _dedup_openings_across_rooms(
+                all_room_openings, unit_rooms, filler,
+            )
+
+            for room_idx, room in enumerate(unit_rooms, start=1):
+                output_room_type = _map_room_type_for_output(room.label)
+
+                # Extract boundary polygon in meters, centered at origin
+                vertices_m, (cx, cz) = _extract_boundary_meters(room, filler)
+
+                room_openings = all_room_openings[room_idx - 1]
 
                 # Extract door centroids for rotation computation
                 door_centroids_m = []
@@ -472,7 +687,7 @@ class Exporter:
             # Export unit overview SVG
             overview_svg_name = f"unit_{unit.id}_overview.svg"
             overview_svg_path = os.path.join(unit_dir, overview_svg_name)
-            _export_unit_svg(svg_path, unit_rooms, overview_svg_path)
+            _export_unit_svg(svg_path, unit_rooms, overview_svg_path, filler=filler)
             print(f"Saved: {overview_svg_path}")
 
             # Export unit overview PNG

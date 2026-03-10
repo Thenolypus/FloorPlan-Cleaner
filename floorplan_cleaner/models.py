@@ -23,6 +23,9 @@ class Room:
     unit_id: int | None = None
     split_from: int | None = None  # id of original room this was split from
     split_line_px: tuple | None = None  # ((x1,y1),(x2,y2)) in pixel coords for mask generation
+    # Each entry: {"edge_p1_svg": (x,y), "edge_p2_svg": (x,y),
+    #              "normal_svg": (nx,ny), "offset_svg": float}
+    boundary_extensions: list = field(default_factory=list)
 
 
 @dataclass

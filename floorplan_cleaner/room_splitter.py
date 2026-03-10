@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import cv2
 from .models import IfcElement
@@ -136,3 +137,89 @@ def assign_elements_to_halves(
             elems_b.append(elem)
 
     return elems_a, elems_b
+
+
+# ---------------------------------------------------------------------------
+# Boundary extension helpers
+# ---------------------------------------------------------------------------
+
+def simplify_contour_for_extend(mask: np.ndarray, epsilon: float = 5.0) -> np.ndarray:
+    """Moderately simplified contour for boundary extension UI.
+
+    Returns an Nx2 array of (x, y) pixel coordinates.
+    """
+    contour = mask_to_contour(mask)
+    contour_f = contour.astype(np.float32).reshape(-1, 1, 2)
+    simplified = cv2.approxPolyDP(contour_f, epsilon, closed=True)
+    return simplified.reshape(-1, 2)
+
+
+def point_to_segment_distance(
+    px: float, py: float, x1: float, y1: float, x2: float, y2: float
+) -> float:
+    """Shortest distance from point (px, py) to segment (x1,y1)-(x2,y2)."""
+    dx, dy = x2 - x1, y2 - y1
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-10:
+        return math.sqrt((px - x1) ** 2 + (py - y1) ** 2)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return math.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
+
+def find_nearest_edge(px: int, py: int, contour: np.ndarray) -> tuple[int, float]:
+    """Index and distance of the nearest contour edge to (px, py)."""
+    min_dist = float("inf")
+    min_idx = -1
+    n = len(contour)
+    for i in range(n):
+        p1 = contour[i]
+        p2 = contour[(i + 1) % n]
+        d = point_to_segment_distance(
+            float(px), float(py),
+            float(p1[0]), float(p1[1]),
+            float(p2[0]), float(p2[1]),
+        )
+        if d < min_dist:
+            min_dist = d
+            min_idx = i
+    return min_idx, min_dist
+
+
+def compute_outward_normal(
+    contour: np.ndarray, edge_idx: int, mask: np.ndarray
+) -> tuple[float, float]:
+    """Unit normal of edge *edge_idx* pointing away from the room interior."""
+    p1 = contour[edge_idx].astype(np.float64)
+    p2 = contour[(edge_idx + 1) % len(contour)].astype(np.float64)
+
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-6:
+        return (0.0, 0.0)
+
+    # Two candidate normals
+    n1 = (-dy / length, dx / length)
+    n2 = (dy / length, -dx / length)
+
+    mid_x = (p1[0] + p2[0]) / 2
+    mid_y = (p1[1] + p2[1]) / 2
+    test_dist = 10.0
+
+    h, w = mask.shape
+
+    def _inside(nx, ny):
+        tx = int(mid_x + nx * test_dist)
+        ty = int(mid_y + ny * test_dist)
+        return 0 <= ty < h and 0 <= tx < w and mask[ty, tx]
+
+    in1 = _inside(*n1)
+    in2 = _inside(*n2)
+
+    if in1 and not in2:
+        return n2  # n2 points outward
+    if in2 and not in1:
+        return n1  # n1 points outward
+    return n1  # ambiguous – default

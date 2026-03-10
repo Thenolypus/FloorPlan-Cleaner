@@ -1,7 +1,7 @@
 """
 Reproject top-down rendered room scenes back onto the original floorplan.
 
-Reads metadata.json for room positions, retrieval result JSONs for room bounds,
+Reads metadata.json for room positions, generated_scene.json for room bounds,
 and top-down render images. Composites them onto the unit overview PNG at the
 correct scale and position.
 
@@ -12,18 +12,15 @@ The render viewport is computed to match viz.py's setup_camera():
   - Top view is flipped vertically
 
 Usage:
-    python visualize_reprojection.py \
-        --metadata "output/03OG PLAN/metadata.json" \
-        --scenes input/generated_scenes/13feb_settings_retrieval \
-        --unit 1 \
-        --variant greedy \
-        --output reprojection_result.png
+    python visualize_reprojection.py --floorplan input/generated_scenes/03OG_PLAN
+    python visualize_reprojection.py --floorplan input/generated_scenes/03OG_PLAN --unit 1
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import sys
 
 import cv2
@@ -38,16 +35,15 @@ def load_metadata(metadata_path: str) -> dict:
         return json.load(f)
 
 
-def get_unit_svg_bbox(unit_entry: dict) -> tuple[float, float, float, float]:
-    """Compute the combined SVG bounding box of all rooms in a unit.
-    Returns (min_x, min_y, max_x, max_y) in SVG coords.
-    """
-    rooms = unit_entry["rooms"]
-    min_x = min(r["bbox_in_svg"]["x"] for r in rooms)
-    min_y = min(r["bbox_in_svg"]["y"] for r in rooms)
-    max_x = max(r["bbox_in_svg"]["x"] + r["bbox_in_svg"]["width"] for r in rooms)
-    max_y = max(r["bbox_in_svg"]["y"] + r["bbox_in_svg"]["height"] for r in rooms)
-    return min_x, min_y, max_x, max_y
+def parse_svg_viewbox(svg_path: str) -> tuple[float, float, float, float]:
+    """Parse viewBox from an SVG file. Returns (x, y, width, height)."""
+    with open(svg_path, "r", encoding="utf-8") as f:
+        svg_text = f.read(2000)  # viewBox is always near the top
+    match = re.search(r'viewBox="([^"]*)"', svg_text)
+    if not match:
+        raise ValueError(f"No viewBox found in {svg_path}")
+    parts = match.group(1).split()
+    return tuple(float(p) for p in parts)
 
 
 def compute_render_viewport_half(bounds_bottom: list[list[float]]) -> float:
@@ -55,9 +51,6 @@ def compute_render_viewport_half(bounds_bottom: list[list[float]]) -> float:
 
     Replicates the camera setup from viz.py setup_camera() with
     use_dynamic_zoom=True, camera_height=None, yfov=pi/4.
-
-    The top-down render covers a square viewport of
-    [-viewport_half, +viewport_half] in both X and Z, centered at origin.
     """
     xs = [v[0] for v in bounds_bottom]
     zs = [v[2] for v in bounds_bottom]
@@ -77,9 +70,8 @@ def room_local_to_svg(x: float, z: float, cx: float, cz: float,
                       rotation_rad: float) -> tuple[float, float]:
     """Convert room-local meter coords (x, z) back to SVG coords.
 
-    Reverses: center, rotate, meters-to-SVG.
-    Export did: SVG -> meters -> center -> rotate
-    So inverse is: un-rotate -> un-center -> meters-to-SVG
+    Export pipeline: SVG -> meters -> center -> rotate
+    Inverse: un-rotate -> un-center -> meters-to-SVG
     """
     if rotation_rad != 0.0:
         cos_a = math.cos(-rotation_rad)
@@ -98,11 +90,12 @@ def room_local_to_svg(x: float, z: float, cx: float, cz: float,
 
 
 def svg_to_overview_px(svg_x: float, svg_y: float,
-                       svg_min_x: float, svg_min_y: float,
-                       scale: float, margin: float) -> tuple[float, float]:
-    """Convert SVG coords to overview PNG pixel coords."""
-    px = (svg_x - svg_min_x) * scale + margin
-    py = (svg_y - svg_min_y) * scale + margin
+                       vb_x: float, vb_y: float,
+                       vb_w: float, vb_h: float,
+                       png_w: int, png_h: int) -> tuple[float, float]:
+    """Convert SVG coords to overview PNG pixel coords using SVG viewBox."""
+    px = (svg_x - vb_x) / vb_w * png_w
+    py = (svg_y - vb_y) / vb_h * png_h
     return px, py
 
 
@@ -110,39 +103,35 @@ def compute_render_to_overview_affine(
     bounds_bottom: list[list[float]],
     render_w: int, render_h: int,
     cx: float, cz: float, rotation_rad: float,
-    svg_min_x: float, svg_min_y: float,
-    svg_scale: float, margin: float,
+    vb_x: float, vb_y: float, vb_w: float, vb_h: float,
+    png_w: int, png_h: int,
 ) -> np.ndarray:
     """Compute the 2x3 affine matrix from render pixels to overview pixels.
 
     The render viewport is a square [-vh, +vh] x [-vh, +vh] in room-local
-    X-Z space, where vh = camera_height * tan(pi/8). The image is flipped
-    vertically, so pixel (0,0) maps to (-vh, +vh) in (X, Z).
+    X-Z space. After the vertical flip in viz.py:
+      pixel (0,0) top-left     -> room (-vh, +vh)  [min X, max Z]
+      pixel (W,0) top-right    -> room (+vh, +vh)  [max X, max Z]
+      pixel (0,H) bottom-left  -> room (-vh, -vh)  [min X, min Z]
     """
     vh = compute_render_viewport_half(bounds_bottom)
 
-    # Three source points in render pixel space
     src_pts = np.float32([
-        [0, 0],                # top-left of render
-        [render_w, 0],         # top-right of render
-        [0, render_h],         # bottom-left of render
+        [0, 0],
+        [render_w, 0],
+        [0, render_h],
     ])
 
-    # After vertical flip, the pixel-to-room mapping is:
-    #   pixel (0,0) top-left     -> room (-vh, +vh)  [min X, max Z]
-    #   pixel (W,0) top-right    -> room (+vh, +vh)  [max X, max Z]
-    #   pixel (0,H) bottom-left  -> room (-vh, -vh)  [min X, min Z]
     room_pts = [
         (-vh, +vh),
         (+vh, +vh),
         (-vh, -vh),
     ]
 
-    # Map each through the full transform chain to overview pixels
     dst_pts = []
     for rx, rz in room_pts:
         sx, sy = room_local_to_svg(rx, rz, cx, cz, rotation_rad)
-        px, py = svg_to_overview_px(sx, sy, svg_min_x, svg_min_y, svg_scale, margin)
+        px, py = svg_to_overview_px(sx, sy, vb_x, vb_y, vb_w, vb_h, png_w, png_h)
         dst_pts.append([px, py])
     dst_pts = np.float32(dst_pts)
 
@@ -158,90 +147,64 @@ def create_render_mask(render_img: np.ndarray, threshold: int = 245) -> np.ndarr
     return mask
 
 
-def find_retrieval_json(scenes_dir: str, unit_id: int, room_id: int,
-                        room_type: str) -> str | None:
-    """Find the retrieval results JSON for a given room."""
-    type_str = room_type.replace("/", "_").split("/")[0]
-    if type_str == "livingroom_diningroom":
-        type_str = "livingroom"
-    candidates = [
-        f"retrieval_results_unit_{unit_id}_room_{room_id}_{type_str}.json",
-    ]
-    for name in candidates:
-        path = os.path.join(scenes_dir, name)
-        if os.path.exists(path):
-            return path
-    return None
+def room_type_to_filename(room_type: str) -> str:
+    """Convert room_type from metadata to the filename convention."""
+    t = room_type.replace("/", "_").split("/")[0]
+    if t == "livingroom_diningroom":
+        t = "livingroom"
+    return t
 
 
-def find_render_image(scenes_dir: str, unit_id: int, room_id: int,
-                      room_type: str, variant: str) -> str | None:
-    """Find the top-down render image for a given room."""
-    type_str = room_type.replace("/", "_").split("/")[0]
-    if type_str == "livingroom_diningroom":
-        type_str = "livingroom"
-    dir_name = f"render_unit_{unit_id}_room_{room_id}_{type_str}"
-    filename = f"{variant}_unit_{unit_id}_room_{room_id}_{type_str}.jpg"
-    path = os.path.join(scenes_dir, dir_name, "top", filename)
-    if os.path.exists(path):
-        return path
-    return None
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Reproject rendered room scenes onto the floorplan overview."
+def find_generated_scene(floorplan_dir: str, unit_id: int, room_id: int,
+                         room_type: str) -> str | None:
+    """Find the generated_scene.json for a room."""
+    t = room_type_to_filename(room_type)
+    path = os.path.join(
+        floorplan_dir, f"unit_{unit_id}", "output",
+        f"unit_{unit_id}_room_{room_id}_{t}",
+        "generated_scene.json"
     )
-    parser.add_argument("--metadata", required=True,
-                        help="Path to metadata.json")
-    parser.add_argument("--scenes", required=True,
-                        help="Path to generated scenes directory with retrieval results and renders")
-    parser.add_argument("--unit", type=int, required=True,
-                        help="Unit ID to visualize")
-    parser.add_argument("--variant", default="greedy", choices=["greedy", "stochastic"],
-                        help="Which retrieval variant to use (default: greedy)")
-    parser.add_argument("--output", default="reprojection_result.png",
-                        help="Output image path")
-    parser.add_argument("--opacity", type=float, default=0.85,
-                        help="Opacity of the rendered overlay (0-1, default: 0.85)")
-    args = parser.parse_args()
+    return path if os.path.exists(path) else None
 
-    metadata = load_metadata(args.metadata)
-    base_dir = os.path.dirname(args.metadata)
 
-    unit_entry = None
-    for u in metadata["units"]:
-        if u["unit_id"] == args.unit:
-            unit_entry = u
-            break
-    if unit_entry is None:
-        print(f"Unit {args.unit} not found in metadata.")
-        sys.exit(1)
+def find_render_image(floorplan_dir: str, unit_id: int, room_id: int,
+                      room_type: str) -> str | None:
+    """Find the top-down render image for a room."""
+    t = room_type_to_filename(room_type)
+    name = f"unit_{unit_id}_room_{room_id}_{t}"
+    path = os.path.join(
+        floorplan_dir, f"unit_{unit_id}", "output", name,
+        "render", "top", f"{name}.jpg"
+    )
+    return path if os.path.exists(path) else None
 
+
+def process_unit(floorplan_dir: str, metadata: dict, unit_entry: dict,
+                 opacity: float) -> np.ndarray | None:
+    """Process a single unit: reproject all room renders onto the overview."""
+    unit_id = unit_entry["unit_id"]
+    base_dir = os.path.dirname(os.path.join(floorplan_dir, "metadata.json"))
+
+    # Load overview PNG
     overview_path = os.path.join(base_dir, unit_entry["overview_png"])
     overview = cv2.imread(overview_path)
     if overview is None:
-        print(f"Could not load overview: {overview_path}")
-        sys.exit(1)
-
+        print(f"  Could not load overview: {overview_path}")
+        return None
     oh, ow = overview.shape[:2]
 
-    svg_min_x, svg_min_y, svg_max_x, svg_max_y = get_unit_svg_bbox(unit_entry)
-    svg_w = svg_max_x - svg_min_x
-    svg_h = svg_max_y - svg_min_y
+    # Parse overview SVG viewBox for coordinate mapping
+    svg_path = os.path.join(base_dir, unit_entry["overview_svg"])
+    if not os.path.exists(svg_path):
+        print(f"  Could not find overview SVG: {svg_path}")
+        return None
+    vb_x, vb_y, vb_w, vb_h = parse_svg_viewbox(svg_path)
 
-    margin_px = 20.0
-    scale_x = (ow - 2 * margin_px) / svg_w
-    scale_y = (oh - 2 * margin_px) / svg_h
-    svg_scale = (scale_x + scale_y) / 2.0
-
-    print(f"Overview: {ow}x{oh} px")
-    print(f"Unit SVG bbox: ({svg_min_x:.1f}, {svg_min_y:.1f}) - ({svg_max_x:.1f}, {svg_max_y:.1f})")
-    print(f"SVG-to-pixel scale: {svg_scale:.3f} px/SVG-unit")
+    print(f"  Overview: {ow}x{oh} px, viewBox: ({vb_x:.1f}, {vb_y:.1f}, {vb_w:.1f}, {vb_h:.1f})")
 
     result = overview.copy()
-
     rooms_processed = 0
+
     for room_entry in unit_entry["rooms"]:
         room_id = room_entry["room_id"]
         room_type = room_entry["room_type"]
@@ -249,36 +212,32 @@ def main():
         cz = room_entry["center_offset_m"]["z"]
         rotation_rad = room_entry.get("rotation_rad", 0.0)
 
-        retrieval_path = find_retrieval_json(
-            args.scenes, args.unit, room_id, room_type)
-        if retrieval_path is None:
-            print(f"  Room {room_id} ({room_type}): no retrieval JSON found, skipping")
+        scene_path = find_generated_scene(floorplan_dir, unit_id, room_id, room_type)
+        if scene_path is None:
+            print(f"    Room {room_id} ({room_type}): no generated_scene.json, skipping")
             continue
 
-        render_path = find_render_image(
-            args.scenes, args.unit, room_id, room_type, args.variant)
+        render_path = find_render_image(floorplan_dir, unit_id, room_id, room_type)
         if render_path is None:
-            print(f"  Room {room_id} ({room_type}): no render image found, skipping")
+            print(f"    Room {room_id} ({room_type}): no render image, skipping")
             continue
 
-        with open(retrieval_path) as f:
-            retrieval = json.load(f)
-        scene = retrieval[args.variant]
+        with open(scene_path) as f:
+            scene = json.load(f)
         bounds_bottom = scene["bounds_bottom"]
 
         render_img = cv2.imread(render_path)
         if render_img is None:
-            print(f"  Room {room_id} ({room_type}): could not load render, skipping")
+            print(f"    Room {room_id} ({room_type}): could not load render, skipping")
             continue
 
         rh, rw = render_img.shape[:2]
         vh = compute_render_viewport_half(bounds_bottom)
 
-        # Compute affine using exact camera viewport
         affine = compute_render_to_overview_affine(
             bounds_bottom, rw, rh,
             cx, cz, rotation_rad,
-            svg_min_x, svg_min_y, svg_scale, margin_px,
+            vb_x, vb_y, vb_w, vb_h, ow, oh,
         )
 
         warped = cv2.warpAffine(render_img, affine, (ow, oh),
@@ -291,21 +250,67 @@ def main():
 
         blended = result.copy()
         blended[mask_3ch] = (
-            args.opacity * warped[mask_3ch].astype(float) +
-            (1 - args.opacity) * result[mask_3ch].astype(float)
+            opacity * warped[mask_3ch].astype(float) +
+            (1 - opacity) * result[mask_3ch].astype(float)
         ).astype(np.uint8)
         result = blended
 
         n_objects = len(scene.get("objects", []))
-        print(f"  Room {room_id} ({room_type}): viewport_half={vh:.2f}m, cam_h={vh/math.tan(HALF_FOV):.1f}m, {n_objects} objects")
+        print(f"    Room {room_id} ({room_type}): vh={vh:.2f}m, rot={math.degrees(rotation_rad):.0f}deg, {n_objects} objects")
         rooms_processed += 1
 
     if rooms_processed == 0:
-        print("No rooms were projected. Check your --scenes path and file naming.")
+        print(f"  No rooms projected for unit {unit_id}.")
+        return None
+
+    print(f"  {rooms_processed} rooms projected.")
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reproject rendered room scenes onto the floorplan overview."
+    )
+    parser.add_argument("--floorplan", required=True,
+                        help="Path to floorplan directory (e.g. input/generated_scenes/03OG_PLAN)")
+    parser.add_argument("--unit", type=int, default=None,
+                        help="Unit ID to visualize (default: all units)")
+    parser.add_argument("--opacity", type=float, default=0.85,
+                        help="Opacity of the rendered overlay (0-1, default: 0.85)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Output directory (default: <floorplan>/reprojection)")
+    args = parser.parse_args()
+
+    metadata_path = os.path.join(args.floorplan, "metadata.json")
+    if not os.path.exists(metadata_path):
+        print(f"metadata.json not found in {args.floorplan}")
         sys.exit(1)
 
-    cv2.imwrite(args.output, result)
-    print(f"\nSaved: {args.output} ({rooms_processed} rooms projected)")
+    metadata = load_metadata(metadata_path)
+
+    output_dir = args.output_dir or os.path.join(args.floorplan, "reprojection")
+    os.makedirs(output_dir, exist_ok=True)
+
+    units_to_process = metadata["units"]
+    if args.unit is not None:
+        units_to_process = [u for u in units_to_process if u["unit_id"] == args.unit]
+        if not units_to_process:
+            print(f"Unit {args.unit} not found in metadata.")
+            sys.exit(1)
+
+    for unit_entry in units_to_process:
+        unit_id = unit_entry["unit_id"]
+        print(f"Unit {unit_id}:")
+
+        result = process_unit(args.floorplan, metadata, unit_entry, args.opacity)
+        if result is None:
+            continue
+
+        output_path = os.path.join(output_dir, f"unit_{unit_id}_reprojection.png")
+        cv2.imwrite(output_path, result)
+        print(f"  Saved: {output_path}")
+
+    print("Done.")
 
 
 if __name__ == "__main__":
