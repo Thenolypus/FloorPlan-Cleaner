@@ -32,3 +32,22 @@ class Room:
 class ApartmentUnit:
     id: int
     room_ids: list = field(default_factory=list)
+
+
+@dataclass
+class ManualOpening:
+    id: int
+    type: str  # "door" or "window"
+    wall_index: int  # index into room's vertices list (wall from vertices[i] to vertices[i+1])
+    t: float  # 0-1 position along the wall segment (center of opening)
+    width: float  # meters (along the wall)
+    height: float  # meters (vertical, for 3D export)
+    linked_opening: tuple | None = None  # (room_id, opening_id) of the mirrored opening on shared wall
+
+
+@dataclass
+class ManualRoom:
+    id: int
+    label: str
+    vertices: list = field(default_factory=list)  # [(x_m, y_m), ...] in meters, closed polygon
+    openings: list = field(default_factory=list)  # list of ManualOpening

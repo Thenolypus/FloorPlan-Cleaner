@@ -7,7 +7,7 @@ import numpy as np
 import cv2
 from PIL import Image
 
-from .models import Room, ApartmentUnit, IfcElement
+from .models import Room, ApartmentUnit, IfcElement, ManualRoom, ManualOpening
 from .flood_fill import FloodFiller
 from .room_splitter import mask_to_contour
 
@@ -708,6 +708,150 @@ class Exporter:
         print(f"Saved: {svg_dest}")
 
         # Write metadata
+        meta_path = os.path.join(base_dir, "metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Saved: {meta_path}")
+
+    def export_manual_unit(
+        self,
+        rooms: list[ManualRoom],
+        height_m: float,
+        output_dir: str,
+    ):
+        """Export manually created rooms to the same JSON format as SVG-based rooms."""
+        base_dir = os.path.join(output_dir, "manual_unit")
+        unit_dir = os.path.join(base_dir, "unit_1")
+        os.makedirs(unit_dir, exist_ok=True)
+
+        metadata = {
+            "source": "manual_creation",
+            "default_height_m": height_m,
+            "units": [],
+        }
+
+        unit_entry = {
+            "unit_id": 1,
+            "rooms": [],
+        }
+
+        for room_idx, room in enumerate(rooms, start=1):
+            output_room_type = _map_room_type_for_output(room.label)
+
+            # Convert vertices to meters centered at bbox midpoint
+            # In create mode vertices are already in meters.
+            # Canvas Y points down, map to: X = canvas_x, Z = -canvas_y
+            vertices_m = [[v[0], -v[1]] for v in room.vertices]
+            verts_arr = np.array(vertices_m)
+
+            min_coords = verts_arr.min(axis=0)
+            max_coords = verts_arr.max(axis=0)
+            center = (min_coords + max_coords) / 2.0
+            cx, cz = float(center[0]), float(center[1])
+
+            centered = (verts_arr - center).round(2).tolist()
+
+            # Remove near-collinear vertices
+            centered = _remove_collinear(centered)
+
+            # Compute door rotation
+            door_centroids = []
+            for opening in room.openings:
+                if opening.type == "door":
+                    i = opening.wall_index
+                    n = len(room.vertices)
+                    p1 = np.array(room.vertices[i], dtype=np.float64)
+                    p2 = np.array(room.vertices[(i + 1) % n], dtype=np.float64)
+                    wall_dir = p2 - p1
+                    wall_len = np.linalg.norm(wall_dir)
+                    pos = p1 + (wall_dir / wall_len) * (opening.t * wall_len)
+                    door_centroids.append((pos[0], -pos[1]))
+
+            rotation_rad = _compute_door_rotation(door_centroids, cx, cz)
+            if rotation_rad != 0.0:
+                centered = _rotate_vertices(centered, rotation_rad)
+
+            # Convert openings to 3D
+            openings_3d = []
+            for opening in room.openings:
+                i = opening.wall_index
+                n = len(room.vertices)
+                p1 = np.array(room.vertices[i], dtype=np.float64)
+                p2 = np.array(room.vertices[(i + 1) % n], dtype=np.float64)
+                wall_vec = p2 - p1
+                wall_len = np.linalg.norm(wall_vec)
+                wall_dir = wall_vec / wall_len
+                pos = p1 + wall_dir * (opening.t * wall_len)
+
+                # Map to 3D coords (X = canvas_x, Z = -canvas_y), centered
+                mx = pos[0] - cx
+                mz = -pos[1] - cz
+
+                # Determine opening extent along wall in 3D
+                # Wall direction in 3D
+                wall_3d = np.array([wall_dir[0], -wall_dir[1]])
+                sx = abs(wall_3d[0]) * opening.width + abs(wall_3d[1]) * WALL_THICKNESS_M
+                sz = abs(wall_3d[1]) * opening.width + abs(wall_3d[0]) * WALL_THICKNESS_M
+                # Ensure minimum thickness
+                sx = max(sx, WALL_THICKNESS_M)
+                sz = max(sz, WALL_THICKNESS_M)
+
+                if rotation_rad != 0.0:
+                    cos_a = math.cos(rotation_rad)
+                    sin_a = math.sin(rotation_rad)
+                    rx = mx * cos_a - mz * sin_a
+                    rz = mx * sin_a + mz * cos_a
+                    mx, mz = rx, rz
+                    steps = round(rotation_rad / (math.pi / 2)) % 4
+                    if steps in (1, 3):
+                        sx, sz = sz, sx
+
+                if opening.type == "window":
+                    y_center = DEFAULT_WINDOW_SILL_M + DEFAULT_WINDOW_HEIGHT_M / 2
+                    sy = DEFAULT_WINDOW_HEIGHT_M
+                else:
+                    y_center = DEFAULT_DOOR_HEIGHT_M / 2
+                    sy = DEFAULT_DOOR_HEIGHT_M
+
+                openings_3d.append({
+                    "type": opening.type,
+                    "pos": [round(mx, 2), round(y_center, 2), round(mz, 2)],
+                    "size": [round(sx, 2), round(sy, 2), round(sz, 2)],
+                })
+
+            bounds_top = [[v[0], height_m, v[1]] for v in centered]
+            bounds_bottom = [[v[0], 0.0, v[1]] for v in centered]
+
+            ssr = {
+                "room_type": output_room_type,
+                "bounds_top": bounds_top,
+                "bounds_bottom": bounds_bottom,
+                "objects": [],
+                "openings": openings_3d,
+            }
+
+            type_str = output_room_type.replace("/", "_")
+            filename = f"unit_1_room_{room_idx}_{type_str}.json"
+            filepath = os.path.join(unit_dir, filename)
+            relative_path = f"unit_1/{filename}"
+
+            with open(filepath, "w") as f:
+                json.dump(ssr, f, indent=4)
+
+            n_doors = sum(1 for o in openings_3d if o["type"] == "door")
+            n_windows = sum(1 for o in openings_3d if o["type"] == "window")
+            print(f"Saved: {filepath} | vertices: {len(centered)} | doors: {n_doors} | windows: {n_windows}")
+
+            unit_entry["rooms"].append({
+                "room_id": room_idx,
+                "room_type": room.label or "unlabelled",
+                "output_file": relative_path,
+                "center_offset_m": {"x": round(cx, 2), "z": round(cz, 2)},
+                "rotation_rad": round(rotation_rad, 6),
+            })
+
+        metadata["units"].append(unit_entry)
+
         meta_path = os.path.join(base_dir, "metadata.json")
         with open(meta_path, "w") as f:
             json.dump(metadata, f, indent=2)

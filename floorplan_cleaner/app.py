@@ -4,11 +4,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QDockWidget, QVBoxLayout, QHBoxLayout,
     QWidget, QLabel, QComboBox, QPushButton, QListWidget, QListWidgetItem,
-    QMessageBox, QStatusBar, QToolBar, QLineEdit,
+    QMessageBox, QStatusBar, QToolBar, QLineEdit, QStackedWidget,
+    QButtonGroup, QRadioButton,
 )
 from PySide6.QtGui import QAction
 
 from .canvas import FloorPlanCanvas, SELECTED_ROOM_COLOR, LABELED_ROOM_COLOR
+from .create_canvas import CreateModeCanvas
 from .svg_parser import SvgParser
 from .flood_fill import FloodFiller
 from .export import Exporter
@@ -20,6 +22,10 @@ from .room_splitter import simplify_contour_for_extend
 ROOM_TYPES = ["bedroom", "livingroom", "diningroom", "all", "bathroom", "balcony"]
 TARGET_LONGEST_SIDE = 2000
 
+# Mode constants
+MODE_SVG = 0
+MODE_CREATE = 1
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -27,7 +33,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FloorPlan Cleaner")
         self.resize(1200, 800)
 
-        # State
+        # Current mode
+        self._mode = MODE_SVG
+
+        # --- SVG mode state ---
         self._svg_path: str | None = None
         self._input_name: str | None = None
         self._parser: SvgParser | None = None
@@ -38,11 +47,22 @@ class MainWindow(QMainWindow):
         self._room_counter = 0
         self._scale: float = 1.0
 
-        # Canvas
+        # --- Canvases ---
+        self._stacked = QStackedWidget()
+        self.setCentralWidget(self._stacked)
+
+        # SVG canvas
         self._canvas = FloorPlanCanvas()
-        self.setCentralWidget(self._canvas)
         self._canvas.room_clicked.connect(self._on_room_clicked)
         self._canvas.boundary_extend_confirmed.connect(self._on_boundary_extended)
+        self._stacked.addWidget(self._canvas)  # index 0
+
+        # Create canvas
+        self._create_canvas = CreateModeCanvas()
+        self._create_canvas.status_message.connect(lambda msg: self.statusBar().showMessage(msg))
+        self._create_canvas.room_created.connect(self._on_create_room_created)
+        self._create_canvas.rooms_changed.connect(self._on_create_rooms_changed)
+        self._stacked.addWidget(self._create_canvas)  # index 1
 
         # Sidebar
         self._setup_sidebar()
@@ -52,7 +72,7 @@ class MainWindow(QMainWindow):
 
         # Status bar
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Open an SVG file to begin.")
+        self.statusBar().showMessage("Open an SVG file or create a unit from scratch.")
 
     def _setup_toolbar(self):
         toolbar = QToolBar("Main")
@@ -63,18 +83,39 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._open_svg)
         toolbar.addAction(open_action)
 
+        create_action = QAction("Create Unit", self)
+        create_action.triggered.connect(self._enter_create_mode)
+        toolbar.addAction(create_action)
+
         reset_action = QAction("Reset", self)
         reset_action.triggered.connect(self._reset)
         toolbar.addAction(reset_action)
 
     def _setup_sidebar(self):
-        dock = QDockWidget("Room Panel", self)
+        dock = QDockWidget("Panel", self)
         dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
+        # Use a stacked widget for the sidebar too
+        self._sidebar_stack = QStackedWidget()
 
+        # --- SVG mode sidebar (index 0) ---
+        svg_container = QWidget()
+        svg_layout = QVBoxLayout(svg_container)
+        self._build_svg_sidebar(svg_layout)
+        self._sidebar_stack.addWidget(svg_container)
+
+        # --- Create mode sidebar (index 1) ---
+        create_container = QWidget()
+        create_layout = QVBoxLayout(create_container)
+        self._build_create_sidebar(create_layout)
+        self._sidebar_stack.addWidget(create_container)
+
+        dock.setWidget(self._sidebar_stack)
+        dock.setMinimumWidth(220)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def _build_svg_sidebar(self, layout: QVBoxLayout):
         # Room type selection
         layout.addWidget(QLabel("Room Type:"))
         self._type_combo = QComboBox()
@@ -130,15 +171,238 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        dock.setWidget(container)
-        dock.setMinimumWidth(220)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+    def _build_create_sidebar(self, layout: QVBoxLayout):
+        layout.addWidget(QLabel("-- Create Mode --"))
+
+        # Tools
+        layout.addWidget(QLabel("Tool:"))
+        self._create_tool_group = QButtonGroup(self)
+
+        tools = [
+            ("Draw Walls", "draw_walls"),
+            ("Add Door", "add_door"),
+            ("Add Window", "add_window"),
+            ("Select / Resize", "select"),
+        ]
+        for label, tool_name in tools:
+            rb = QRadioButton(label)
+            rb.setProperty("tool_name", tool_name)
+            rb.toggled.connect(self._on_create_tool_changed)
+            self._create_tool_group.addButton(rb)
+            layout.addWidget(rb)
+            if tool_name == "draw_walls":
+                rb.setChecked(True)
+
+        layout.addWidget(self._make_separator())
+
+        # Room type
+        layout.addWidget(QLabel("Room Type:"))
+        self._create_type_combo = QComboBox()
+        self._create_type_combo.addItems(ROOM_TYPES)
+        layout.addWidget(self._create_type_combo)
+
+        assign_btn = QPushButton("Assign Label")
+        assign_btn.clicked.connect(self._create_assign_label)
+        layout.addWidget(assign_btn)
+
+        # Room list
+        layout.addWidget(QLabel("Rooms:"))
+        self._create_room_list = QListWidget()
+        self._create_room_list.currentItemChanged.connect(self._on_create_room_selection_changed)
+        layout.addWidget(self._create_room_list)
+
+        # Delete buttons
+        btn_row = QHBoxLayout()
+        del_room_btn = QPushButton("Del Room")
+        del_room_btn.clicked.connect(self._create_delete_room)
+        btn_row.addWidget(del_room_btn)
+
+        del_opening_btn = QPushButton("Del Opening")
+        del_opening_btn.clicked.connect(self._create_canvas.delete_selected_opening)
+        btn_row.addWidget(del_opening_btn)
+        layout.addLayout(btn_row)
+
+        # Resize controls
+        layout.addWidget(self._make_separator())
+        layout.addWidget(QLabel("Opening Size:"))
+        size_row = QHBoxLayout()
+        shrink_btn = QPushButton("-")
+        shrink_btn.setFixedWidth(40)
+        shrink_btn.clicked.connect(lambda: self._create_canvas.adjust_selected_opening_width(-0.1))
+        size_row.addWidget(shrink_btn)
+        grow_btn = QPushButton("+")
+        grow_btn.setFixedWidth(40)
+        grow_btn.clicked.connect(lambda: self._create_canvas.adjust_selected_opening_width(0.1))
+        size_row.addWidget(grow_btn)
+        layout.addLayout(size_row)
+
+        layout.addWidget(self._make_separator())
+
+        # Room height
+        layout.addWidget(QLabel("Room Height (m):"))
+        self._create_height_input = QLineEdit("2.6")
+        layout.addWidget(self._create_height_input)
+
+        # Export
+        export_btn = QPushButton("Export Unit")
+        export_btn.clicked.connect(self._create_export)
+        layout.addWidget(export_btn)
+
+        # Save / Load
+        layout.addWidget(self._make_separator())
+        save_btn = QPushButton("Save Project")
+        save_btn.clicked.connect(self._create_save)
+        layout.addWidget(save_btn)
+
+        load_btn = QPushButton("Load Project")
+        load_btn.clicked.connect(self._create_load)
+        layout.addWidget(load_btn)
+
+        # Back to SVG mode
+        layout.addWidget(self._make_separator())
+        back_btn = QPushButton("Back to SVG Mode")
+        back_btn.clicked.connect(self._enter_svg_mode)
+        layout.addWidget(back_btn)
+
+        layout.addStretch()
 
     def _make_separator(self) -> QWidget:
         sep = QWidget()
         sep.setFixedHeight(2)
         sep.setStyleSheet("background-color: #ccc;")
         return sep
+
+    # --- Mode switching ---
+
+    def _enter_create_mode(self):
+        self._mode = MODE_CREATE
+        self._stacked.setCurrentIndex(1)
+        self._sidebar_stack.setCurrentIndex(1)
+        self.statusBar().showMessage(
+            "Create mode: Draw walls to form rooms. Click near first vertex to close polygon."
+        )
+
+    def _enter_svg_mode(self):
+        self._mode = MODE_SVG
+        self._stacked.setCurrentIndex(0)
+        self._sidebar_stack.setCurrentIndex(0)
+        self.statusBar().showMessage("SVG mode. Open an SVG file to begin.")
+
+    # --- Create mode handlers ---
+
+    def _on_create_tool_changed(self, checked: bool):
+        if not checked:
+            return
+        btn = self._create_tool_group.checkedButton()
+        if btn:
+            tool = btn.property("tool_name")
+            self._create_canvas.set_tool(tool)
+
+    def _on_create_room_created(self):
+        self._refresh_create_room_list()
+
+    def _on_create_rooms_changed(self):
+        self._refresh_create_room_list()
+
+    def _refresh_create_room_list(self):
+        self._create_room_list.blockSignals(True)
+        selected_id = None
+        sel_room = self._create_canvas.get_selected_room()
+        if sel_room:
+            selected_id = sel_room.id
+
+        self._create_room_list.clear()
+        for i, room in enumerate(self._create_canvas.rooms):
+            label_str = f"({room.label})" if room.label else "(unlabeled)"
+            n_openings = len(room.openings)
+            text = f"Room {i + 1} {label_str}"
+            if n_openings:
+                text += f" [{n_openings} openings]"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, room.id)
+            self._create_room_list.addItem(item)
+            if room.id == selected_id:
+                self._create_room_list.setCurrentItem(item)
+
+        self._create_room_list.blockSignals(False)
+
+    def _on_create_room_selection_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None):
+        if current is not None:
+            room_id = current.data(Qt.ItemDataRole.UserRole)
+            self._create_canvas.select_room(room_id)
+
+    def _create_assign_label(self):
+        current = self._create_room_list.currentItem()
+        if current is None:
+            self.statusBar().showMessage("Select a room first.")
+            return
+        room_id = current.data(Qt.ItemDataRole.UserRole)
+        room = self._create_canvas._find_room(room_id)
+        if room is None:
+            return
+        room.label = self._create_type_combo.currentText()
+        self._refresh_create_room_list()
+        self.statusBar().showMessage(f"Room labeled as '{room.label}'.")
+
+    def _create_delete_room(self):
+        self._create_canvas.delete_selected_room()
+
+    def _create_export(self):
+        rooms = self._create_canvas.rooms
+        if not rooms:
+            self.statusBar().showMessage("No rooms to export.")
+            return
+
+        unlabeled = [r for r in rooms if not r.label]
+        if unlabeled:
+            self.statusBar().showMessage(f"{len(unlabeled)} room(s) unlabeled. Label all rooms before exporting.")
+            return
+
+        try:
+            height_m = float(self._create_height_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Height", "Room height must be a number.")
+            return
+
+        output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if not output_dir:
+            return
+
+        self.statusBar().showMessage("Exporting...")
+
+        exporter = Exporter()
+        exporter.export_manual_unit(
+            rooms=rooms,
+            height_m=height_m,
+            output_dir=output_dir,
+        )
+
+        self.statusBar().showMessage(f"Export complete: {output_dir}")
+        QMessageBox.information(self, "Export Complete", f"Exported to:\n{output_dir}")
+
+    def _create_save(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Manual Project", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        self._create_canvas.save_project(path)
+        self.statusBar().showMessage(f"Project saved: {path}")
+
+    def _create_load(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Manual Project", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        self._enter_create_mode()
+        self._create_canvas.load_project(path)
+        self._refresh_create_room_list()
+        self.statusBar().showMessage(f"Project loaded: {path} ({len(self._create_canvas.rooms)} rooms)")
+
+    # ===========================================================
+    # SVG mode logic (unchanged from original)
+    # ===========================================================
 
     def _open_svg(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -147,7 +411,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        self._reset()
+        self._enter_svg_mode()
+        self._reset_svg()
         self._input_name = os.path.splitext(os.path.basename(path))[0]
         self.statusBar().showMessage(f"Loading {os.path.basename(path)}...")
 
@@ -186,6 +451,9 @@ class MainWindow(QMainWindow):
         )
 
     def _reset(self):
+        self._reset_svg()
+
+    def _reset_svg(self):
         self._svg_path = None
         self._input_name = None
         self._parser = None
